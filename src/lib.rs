@@ -7,8 +7,9 @@
 //!
 //! # Example
 //!
-//! ``
+//! ```
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     use simplebed::{BedRecord,BedValue,BedReader,BedWriter};
 //!     // Reading a BED file
 //!     let bed_path = std::path::Path::new("tests/test.bed");
 //!     let mut bed_reader = BedReader::new(bed_path)?;
@@ -45,7 +46,7 @@
 //!
 //!     Ok(())
 //! }
-//! ``
+//! ```
 //!
 //! ## Features
 //!
@@ -62,11 +63,14 @@ use noodles::csi;
 
 use noodles::tabix;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 
 pub mod value;
 pub use value::BedValue;
+
+pub mod writer;
+pub use writer::BedWriter;
 
 /// Represents a BED record.
 #[derive(Debug, Clone, PartialEq)]
@@ -147,13 +151,10 @@ pub struct BedReader {
     csi: Option<csi::Index>,
 }
 
-impl BedReader
-{
+impl BedReader {
     /// Creates a new `BedReader` from a file path.
     /// Automatically detects BGZF compression based on file extension (.gz or .bgz).
-    pub fn new<P: AsRef<Path>>(
-        path: P,
-    ) -> Result<BedReader, Box<dyn std::error::Error>> {
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<BedReader, Box<dyn std::error::Error>> {
         let mut file = BufReader::new(File::open(path.as_ref())?);
         let compression = detect_compression(&mut file)?;
 
@@ -254,6 +255,30 @@ impl BedReader
             score,
             other_fields,
         )))
+    }
+
+    /// Returns an iterator over the records in the BED file.
+    pub fn records(&mut self) -> Records<'_> {
+        Records { reader: self }
+    }
+}
+
+/// An iterator over the records in a BED file.
+pub struct Records<'a> {
+    reader: &'a mut BedReader,
+}
+
+impl<'a> Iterator for Records<'a> {
+    type Item = Result<BedRecord, BedError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.reader.read_record() {
+                Ok(Some(record)) => return Some(Ok(record)),
+                Ok(None) => return None, // EOF
+                Err(e) => return Some(Err(e)),
+            }
+        }
     }
 }
 
