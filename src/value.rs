@@ -4,7 +4,7 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq)]
 pub enum BedValue {
     String(String),
-    Int(i64),
+    Integer(i64),
     Float(f64),
 }
 
@@ -13,7 +13,7 @@ impl BedValue {
     /// Tries parsing as Int, then Float, then falls back to String.
     pub fn parse(s: &str) -> Self {
         if let Ok(int_val) = s.parse::<i64>() {
-            BedValue::Int(int_val)
+            BedValue::Integer(int_val)
         } else if let Ok(float_val) = s.parse::<f64>() {
             BedValue::Float(float_val)
         } else {
@@ -26,7 +26,7 @@ impl fmt::Display for BedValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BedValue::String(s) => write!(f, "{}", s),
-            BedValue::Int(i) => write!(f, "{}", i),
+            BedValue::Integer(i) => write!(f, "{}", i),
             BedValue::Float(fl) => write!(f, "{:.4}", fl),
         }
     }

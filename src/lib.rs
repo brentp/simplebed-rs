@@ -7,7 +7,7 @@
 //!
 //! # Example
 //!
-//! ```
+//! ``
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Reading a BED file
 //!     let bed_path = std::path::Path::new("tests/test.bed");
@@ -45,7 +45,7 @@
 //!
 //!     Ok(())
 //! }
-//! ```
+//! ``
 //!
 //! ## Features
 //!
@@ -141,21 +141,19 @@ pub enum BedError {
 }
 
 /// A reader for BED files, supporting plain text, BGZF compression, and tabix indexing.
-pub struct BedReader<R: BufRead> {
-    reader: R,
+pub struct BedReader {
+    reader: Box<dyn BufRead>,
     tbx: Option<tabix::Index>,
     csi: Option<csi::Index>,
 }
 
-impl<R> BedReader<R>
-where
-    R: BufRead,
+impl BedReader
 {
     /// Creates a new `BedReader` from a file path.
     /// Automatically detects BGZF compression based on file extension (.gz or .bgz).
     pub fn new<P: AsRef<Path>>(
         path: P,
-    ) -> Result<BedReader<Box<dyn BufRead>>, Box<dyn std::error::Error>> {
+    ) -> Result<BedReader, Box<dyn std::error::Error>> {
         let mut file = BufReader::new(File::open(path.as_ref())?);
         let compression = detect_compression(&mut file)?;
 
@@ -171,13 +169,13 @@ where
             _ => Box::new(file),
         };
 
-        BedReader::<R>::from_reader(reader, path)
+        BedReader::from_reader(reader, path)
     }
 
     pub fn from_reader<P: AsRef<Path>>(
         reader: Box<dyn BufRead>,
         path: P,
-    ) -> Result<BedReader<Box<dyn BufRead>>, Box<dyn std::error::Error>> {
+    ) -> Result<BedReader, Box<dyn std::error::Error>> {
         let mut br = BedReader {
             reader: reader,
             tbx: None,
@@ -295,5 +293,54 @@ fn detect_compression<R: BufRead>(
         Ok(Compression::GZ)
     } else {
         Ok(Compression::None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{BedReader, BedRecord, BedValue, BufRead};
+    use std::error::Error;
+    use std::path::Path;
+
+    #[test]
+    fn test_read_bed_file() -> Result<(), Box<dyn Error>> {
+        let bed_path = Path::new("tests/test.bed");
+        let mut bed_reader = BedReader::new(bed_path)?;
+
+        let record1 = bed_reader.read_record()?.unwrap();
+        assert_eq!(record1.chrom(), "chr1");
+        assert_eq!(record1.start(), 22);
+        assert_eq!(record1.end(), 44);
+        assert_eq!(record1.name(), Some("TTN"));
+        assert_eq!(record1.score(), Some(34.5));
+        assert_eq!(
+            record1.other_fields(),
+            &[
+                BedValue::String("other_field".to_string()),
+                BedValue::Integer(23),
+                BedValue::Float(65.4)
+            ]
+        );
+
+        let record2 = bed_reader.read_record()?.unwrap();
+        assert_eq!(record2.chrom(), "chr1");
+        assert_eq!(record2.start(), 33);
+        assert_eq!(record2.end(), 54);
+        assert_eq!(record2.name(), Some("TTN"));
+        assert_eq!(record2.score(), None);
+        assert_eq!(record2.other_fields(), &[]);
+
+        let record3 = bed_reader.read_record()?.unwrap();
+        assert_eq!(record3.chrom(), "chr1");
+        assert_eq!(record3.start(), 53);
+        assert_eq!(record3.end(), 94);
+        assert_eq!(record3.name(), None);
+        assert_eq!(record3.score(), None);
+        assert_eq!(record3.other_fields(), &[]);
+
+        let record_none = bed_reader.read_record()?;
+        assert!(record_none.is_none());
+
+        Ok(())
     }
 }
