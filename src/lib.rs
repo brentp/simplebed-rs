@@ -60,16 +60,15 @@
 use flate2::read::GzDecoder;
 use noodles::bgzf;
 
-use noodles::tabix;
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read};
-use std::path::Path;
-
-use noodles::bgzf::VirtualPosition;
+//use noodles::bgzf::io::{BufRead, Read, Seek};
 use noodles::core::{Position, Region};
 use noodles::csi::BinningIndex;
 use noodles::csi::{self as csi, binning_index::index::reference_sequence::bin::Chunk};
+use noodles::tabix;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::ops::Bound;
+use std::path::Path;
 
 pub mod value;
 pub use value::BedValue;
@@ -177,48 +176,45 @@ impl BedIndex {
 }
 
 /// Represents different types of readers for BED files
-enum BedReaderType<R: BufRead> {
+enum BedReaderType<R: Read + Seek> {
     Plain(BufReader<R>),
-    Gzip(BufReader<GzDecoder<R>>),
+    Gzip(GzDecoder<BufReader<R>>),
     Bgzf(bgzf::Reader<BufReader<R>>),
 }
 
-impl<R> BedReaderType<R>
-where
-    R: BufRead,
-{
+impl BedReaderType<File> {
     fn read_line(&mut self, buf: &mut String) -> io::Result<usize> {
         match self {
             BedReaderType::Plain(reader) => reader.read_line(buf),
-            BedReaderType::Gzip(reader) => reader.read_line(buf),
+            BedReaderType::Gzip(reader) => reader.get_mut().read_line(buf),
             BedReaderType::Bgzf(reader) => reader.read_line(buf),
         }
     }
 }
 
 /// A reader for BED files, supporting plain text, BGZF compression, and tabix indexing.
-pub struct BedReader<R>
-where
-    R: BufRead,
-{
-    reader: BedReaderType<R>,
+pub struct BedReader {
+    reader: BedReaderType<File>,
     index: BedIndex,
 }
 
-impl<R> BedReader<R>
-where
-    R: BufRead,
-{
+impl BedReader {
     /// Creates a new `BedReader` from a BufReader.
     pub fn new<P: AsRef<Path>>(
-        reader: R,
+        reader: File,
         path: P,
-    ) -> Result<BedReader<R>, Box<dyn std::error::Error>> {
+    ) -> Result<BedReader, Box<dyn std::error::Error>> {
         let mut reader = BufReader::new(reader);
         let compression = detect_compression(&mut reader)?;
 
+        /*
+        Plain(Box<dyn BufRead>),
+        Gzip(BufReader<GzDecoder<R>>),
+        Bgzf(bgzf::Reader<BufReader<R>>),
+        */
+
         let reader = match compression {
-            Compression::GZ => BedReaderType::Gzip(BufReader::new(GzDecoder::new(reader))),
+            Compression::GZ => BedReaderType::Gzip(GzDecoder::new(reader)),
             Compression::BGZF => BedReaderType::Bgzf(bgzf::Reader::new(reader)),
             _ => BedReaderType::Plain(reader),
         };
@@ -227,17 +223,15 @@ where
     }
 
     // Add a new constructor for path-based creation
-    pub fn from_path<P: AsRef<Path>>(
-        path: P,
-    ) -> Result<BedReader<BufReader<File>>, Box<dyn std::error::Error>> {
-        let reader = BufReader::new(File::open(path.as_ref())?);
+    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<BedReader, Box<dyn std::error::Error>> {
+        let reader = File::open(path.as_ref())?;
         Self::new(reader, path)
     }
 
     pub fn from_reader<P: AsRef<Path>>(
-        reader: BedReaderType<R>,
+        reader: BedReaderType<File>,
         path: P,
-    ) -> Result<BedReader<R>, Box<dyn std::error::Error>> {
+    ) -> Result<BedReader, Box<dyn std::error::Error>> {
         let path = path.as_ref();
         let index = if let Ok(csi_file) = File::open(format!("{}.csi", path.display())) {
             let csi_reader = BufReader::new(Box::new(csi_file));
@@ -316,15 +310,12 @@ where
     }
 
     /// Returns an iterator over the records in the BED file.
-    pub fn records<'a>(&'a mut self) -> Records<'a, R> {
+    pub fn records<'a>(&'a mut self) -> Records<'a> {
         Records { reader: self }
     }
 }
 
-impl<R> BedReader<R>
-where
-    R: noodles::bgzf::io::BufRead + noodles::bgzf::io::Seek,
-{
+impl BedReader {
     /// Query the BED file for records overlapping the given region.
     ///
     /// # Arguments
@@ -389,17 +380,11 @@ where
 }
 
 /// An iterator over the records in a BED file.
-pub struct Records<'a, R>
-where
-    R: BufRead,
-{
-    reader: &'a mut BedReader<R>,
+pub struct Records<'a> {
+    reader: &'a mut BedReader,
 }
 
-impl<'a, R> Iterator for Records<'a, R>
-where
-    R: BufRead,
-{
+impl<'a> Iterator for Records<'a> {
     type Item = Result<BedRecord, BedError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -414,11 +399,8 @@ where
 }
 
 /// An iterator over query results from a BED file.
-pub struct QueryRecords<'a, R>
-where
-    R: BufRead,
-{
-    reader: &'a mut BedReader<R>,
+pub struct QueryRecords<'a> {
+    reader: &'a mut BedReader,
 }
 
 #[derive(Debug, PartialEq)]
@@ -429,11 +411,13 @@ enum Compression {
     None,
 }
 
-fn detect_compression<R: BufRead>(
+fn detect_compression<R: std::io::Read>(
     reader: &mut R,
 ) -> Result<Compression, Box<dyn std::error::Error>> {
-    let buf = reader.fill_buf()?;
+    let mut breader = BufReader::new(reader);
+    let buf = breader.fill_buf()?;
     let mut dec_buf = vec![0u8; buf.len()];
+    use std::io::Read;
 
     let is_gzipped = &buf[0..2] == b"\x1f\x8b";
 
@@ -511,7 +495,7 @@ mod tests {
     #[test]
     fn test_query_bed_file() -> Result<(), Box<dyn Error>> {
         let bed_path = Path::new("tests/compr.bed.gz");
-        let mut bed_reader = BedReader::new(bed_path)?;
+        let mut bed_reader = BedReader::from_path(bed_path)?;
 
         let records: Vec<BedRecord> = bed_reader
             .query(0, "chr1", 22, 34)?
@@ -531,7 +515,7 @@ mod tests {
     #[test]
     fn test_query_first_interval() -> Result<(), Box<dyn Error>> {
         let bed_path = Path::new("tests/compr.bed.gz");
-        let mut bed_reader = BedReader::new(bed_path)?;
+        let mut bed_reader = BedReader::from_path(bed_path)?;
 
         let records: Vec<BedRecord> = bed_reader
             .query(0, "chr1", 1, 3)?
@@ -546,7 +530,7 @@ mod tests {
     #[test]
     fn test_get_big_interval_query() -> Result<(), Box<dyn Error>> {
         let bed_path = Path::new("tests/compr.bed.gz");
-        let mut bed_reader = BedReader::new(bed_path)?;
+        let mut bed_reader = BedReader::from_path(bed_path)?;
 
         let records: Vec<BedRecord> = bed_reader
             .query(0, "chr1", 999998, 999999)?
