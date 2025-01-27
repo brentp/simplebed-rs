@@ -179,7 +179,7 @@ impl BedIndex {
 enum BedReaderType<R: Read + Seek> {
     Plain(BufReader<R>),
     Gzip(GzDecoder<BufReader<R>>),
-    Bgzf(bgzf::Reader<BufReader<R>>),
+    Bgzf(bgzf::Reader<R>),
 }
 
 impl BedReaderType<File> {
@@ -194,7 +194,7 @@ impl BedReaderType<File> {
 
 /// A reader for BED files, supporting plain text, BGZF compression, and tabix indexing.
 pub struct BedReader {
-    reader: BedReaderType<File>,
+    reader: Option<BedReaderType<File>>,
     index: BedIndex,
 }
 
@@ -204,7 +204,7 @@ impl BedReader {
         reader: File,
         path: P,
     ) -> Result<BedReader, Box<dyn std::error::Error>> {
-        let mut reader = BufReader::new(reader);
+        let mut reader = reader;
         let compression = detect_compression(&mut reader)?;
 
         /*
@@ -214,9 +214,9 @@ impl BedReader {
         */
 
         let reader = match compression {
-            Compression::GZ => BedReaderType::Gzip(GzDecoder::new(reader)),
-            Compression::BGZF => BedReaderType::Bgzf(bgzf::Reader::new(reader)),
-            _ => BedReaderType::Plain(reader),
+            Compression::GZ => BedReaderType::Gzip(GzDecoder::new(BufReader::new(reader))),
+            Compression::BGZF => BedReaderType::Bgzf(bgzf::Reader::new(reader)), // Note, while looking at noodles docs I noticed they really stress NOT double buffering here.
+            _ => BedReaderType::Plain(BufReader::new(reader)),
         };
 
         BedReader::from_reader(reader, path)
@@ -245,13 +245,16 @@ impl BedReader {
             BedIndex::None
         };
 
-        Ok(BedReader { reader, index })
+        Ok(BedReader {
+            reader: Some(reader),
+            index,
+        })
     }
 
     /// Reads a single `BedRecord` from the reader.
     pub fn read_record(&mut self) -> Result<Option<BedRecord>, BedError> {
         let mut line = String::new();
-        let bytes_read = self.reader.read_line(&mut line)?;
+        let bytes_read = self.reader.as_mut().unwrap().read_line(&mut line)?;
         if bytes_read == 0 {
             return Ok(None); // EOF
         }
@@ -367,15 +370,23 @@ impl BedReader {
         // Get chunks that overlap this region
         let qchunks = self.index.query(tid, &region);
 
-        match (qchunks, self.reader) {
-            (Some(Ok(chunks)), BedReaderType::Bgzf(ref mut reader)) => {
+        // This is a dirty hack. Since noodles bgzf BufRead and Seek are only implemented on
+        // an owned Reader, by wrapping the reader in an Option, we can temporarily take ownership of
+        // it, and then put it back when we are done with it. Noodles should implement it's traits
+        // on both the owned and &mut refs of Reader.
+        let mut reader = self.reader.take().unwrap();
+
+        let ret = match (qchunks, reader) {
+            (Some(Ok(chunks)), BedReaderType::Bgzf(mut reader)) => {
                 let q = csi::io::Query::new(&mut reader, chunks);
                 let header = self.index.header().expect("No header found");
                 let q = q.indexed_records(&header).filter_by_region(&region);
                 Ok(q)
             }
             _ => unimplemented!(),
-        }
+        };
+        self.reader = Some(reader);
+        ret
     }
 }
 
