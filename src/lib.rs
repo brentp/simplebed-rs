@@ -158,47 +158,86 @@ enum BedIndex {
 }
 
 impl BedIndex {
-    fn query(&self, tid: usize, region: &Region) -> io::Result<Vec<Chunk>> {
+    fn query(&self, tid: usize, region: &Region) -> Option<io::Result<Vec<Chunk>>> {
         match self {
-            BedIndex::Tabix(index) => index.query(tid, region.interval()),
-            BedIndex::Csi(index) => index.query(tid, region.interval()),
-            _ => unimplemented!(),
+            BedIndex::Tabix(index) => Some(index.query(tid, region.interval())),
+            BedIndex::Csi(index) => Some(index.query(tid, region.interval())),
+            BedIndex::None => None,
+        }
+    }
+
+    /// Return the csi header which contains the reference sequence names
+    fn header(&self) -> Option<&csi::binning_index::index::Header> {
+        match self {
+            BedIndex::Tabix(index) => index.header(),
+            BedIndex::Csi(index) => index.header(),
+            BedIndex::None => None,
+        }
+    }
+}
+
+/// Represents different types of readers for BED files
+enum BedReaderType<R: Read> {
+    Plain(BufReader<R>),
+    Gzip(BufReader<GzDecoder<BufReader<R>>>),
+    Bgzf(bgzf::Reader<BufReader<R>>),
+}
+
+impl<R> BedReaderType<R>
+where
+    R: BufRead,
+{
+    fn read_line(&mut self, buf: &mut String) -> io::Result<usize> {
+        match self {
+            BedReaderType::Plain(reader) => reader.read_line(buf),
+            BedReaderType::Gzip(reader) => reader.read_line(buf),
+            BedReaderType::Bgzf(reader) => reader.read_line(buf),
         }
     }
 }
 
 /// A reader for BED files, supporting plain text, BGZF compression, and tabix indexing.
-pub struct BedReader {
-    reader: Box<dyn BufRead>,
+pub struct BedReader<R>
+where
+    R: BufRead,
+{
+    reader: BedReaderType<R>,
     index: BedIndex,
 }
 
-impl BedReader {
-    /// Creates a new `BedReader` from a file path.
-    /// Automatically detects BGZF compression based on file extension (.gz or .bgz).
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<BedReader, Box<dyn std::error::Error>> {
-        let mut file = BufReader::new(File::open(path.as_ref())?);
-        let compression = detect_compression(&mut file)?;
+impl<R> BedReader<R>
+where
+    R: BufRead,
+{
+    /// Creates a new `BedReader` from a BufReader.
+    pub fn new<P: AsRef<Path>>(
+        reader: R,
+        path: P,
+    ) -> Result<BedReader<R>, Box<dyn std::error::Error>> {
+        let mut reader = BufReader::new(reader);
+        let compression = detect_compression(&mut reader)?;
 
         let reader = match compression {
-            Compression::GZ => {
-                let rdr: Box<dyn BufRead> = Box::new(BufReader::new(GzDecoder::new(file)));
-                rdr
-            }
-            Compression::BGZF => {
-                let rdr: Box<dyn BufRead> = Box::new(bgzf::Reader::new(file));
-                rdr
-            }
-            _ => Box::new(file),
+            Compression::GZ => BedReaderType::Gzip(BufReader::new(GzDecoder::new(reader))),
+            Compression::BGZF => BedReaderType::Bgzf(bgzf::Reader::new(reader)),
+            _ => BedReaderType::Plain(reader),
         };
 
         BedReader::from_reader(reader, path)
     }
 
-    pub fn from_reader<P: AsRef<Path>>(
-        reader: Box<dyn BufRead>,
+    // Add a new constructor for path-based creation
+    pub fn from_path<P: AsRef<Path>>(
         path: P,
-    ) -> Result<BedReader, Box<dyn std::error::Error>> {
+    ) -> Result<BedReader<BufReader<File>>, Box<dyn std::error::Error>> {
+        let reader = BufReader::new(File::open(path.as_ref())?);
+        Self::new(reader, path)
+    }
+
+    pub fn from_reader<P: AsRef<Path>>(
+        reader: BedReaderType<R>,
+        path: P,
+    ) -> Result<BedReader<R>, Box<dyn std::error::Error>> {
         let path = path.as_ref();
         let index = if let Ok(csi_file) = File::open(format!("{}.csi", path.display())) {
             let csi_reader = BufReader::new(Box::new(csi_file));
@@ -277,10 +316,15 @@ impl BedReader {
     }
 
     /// Returns an iterator over the records in the BED file.
-    pub fn records(&mut self) -> Records<'_> {
+    pub fn records<'a>(&'a mut self) -> Records<'a, R> {
         Records { reader: self }
     }
+}
 
+impl<R> BedReader<R>
+where
+    R: noodles::bgzf::io::BufRead + noodles::bgzf::io::Seek,
+{
     /// Query the BED file for records overlapping the given region.
     ///
     /// # Arguments
@@ -306,13 +350,13 @@ impl BedReader {
     /// }
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn query(
-        &mut self,
+    pub fn query<'r>(
+        &'r mut self,
         tid: usize,
         chrom: &str,
         start: usize,
         stop: usize,
-    ) -> Result<QueryRecords<'_>, BedError> {
+    ) -> Result<impl Iterator<Item = io::Result<BedRecord>> + 'r, BedError> {
         // Check if we have an index
         if matches!(self.index, BedIndex::None) {
             return Err(BedError::InvalidFormat(
@@ -330,25 +374,32 @@ impl BedReader {
         let region = Region::new(chrom.to_string(), start..=stop);
 
         // Get chunks that overlap this region
-        let chunks = self
-            .index
-            .query(tid, &region)
-            .map_err(|e| BedError::IoError(e))?;
+        let qchunks = self.index.query(tid, &region);
 
-        Ok(QueryRecords {
-            reader: self,
-            chunks,
-            region: region.clone(),
-        })
+        match (qchunks, self.reader) {
+            (Some(Ok(chunks)), BedReaderType::Bgzf(ref mut reader)) => {
+                let q = csi::io::Query::new(&mut reader, chunks);
+                let header = self.index.header().expect("No header found");
+                let q = q.indexed_records(&header).filter_by_region(&region);
+                Ok(q)
+            }
+            _ => unimplemented!(),
+        }
     }
 }
 
 /// An iterator over the records in a BED file.
-pub struct Records<'a> {
-    reader: &'a mut BedReader,
+pub struct Records<'a, R>
+where
+    R: BufRead,
+{
+    reader: &'a mut BedReader<R>,
 }
 
-impl<'a> Iterator for Records<'a> {
+impl<'a, R> Iterator for Records<'a, R>
+where
+    R: BufRead,
+{
     type Item = Result<BedRecord, BedError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -363,44 +414,11 @@ impl<'a> Iterator for Records<'a> {
 }
 
 /// An iterator over query results from a BED file.
-pub struct QueryRecords<'a> {
-    reader: &'a mut BedReader,
-    chunks: Vec<Chunk>,
-    region: Region,
-}
-
-impl<'a> Iterator for QueryRecords<'a> {
-    type Item = Result<BedRecord, BedError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            match self.reader.read_record() {
-                Ok(Some(record)) => {
-                    // Check if record overlaps query region
-                    if record.chrom() == self.region.name()
-                        && record.end()
-                            > match self.region.start() {
-                                Bound::Included(pos) => pos.get() as u64,
-                                Bound::Excluded(pos) => pos.get() as u64,
-                                Bound::Unbounded => 0,
-                            }
-                        && record.start()
-                            < match self.region.end() {
-                                Bound::Included(pos) => pos.get() as u64,
-                                Bound::Excluded(pos) => pos.get() as u64,
-                                Bound::Unbounded => u64::MAX,
-                            }
-                    {
-                        return Some(Ok(record));
-                    }
-                    // Keep reading until we find an overlapping record
-                    continue;
-                }
-                Ok(None) => return None,
-                Err(e) => return Some(Err(e)),
-            }
-        }
-    }
+pub struct QueryRecords<'a, R>
+where
+    R: BufRead,
+{
+    reader: &'a mut BedReader<R>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -451,7 +469,7 @@ mod tests {
     #[test]
     fn test_read_bed_file() -> Result<(), Box<dyn Error>> {
         let bed_path = Path::new("tests/test.bed");
-        let mut bed_reader = BedReader::new(bed_path)?;
+        let mut bed_reader = BedReader::from_path(bed_path)?;
 
         let record1 = bed_reader.read_record()?.unwrap();
         assert_eq!(record1.chrom(), "chr1");
@@ -487,6 +505,53 @@ mod tests {
         let record_none = bed_reader.read_record()?;
         assert!(record_none.is_none());
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_bed_file() -> Result<(), Box<dyn Error>> {
+        let bed_path = Path::new("tests/compr.bed.gz");
+        let mut bed_reader = BedReader::new(bed_path)?;
+
+        let records: Vec<BedRecord> = bed_reader
+            .query(0, "chr1", 22, 34)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].chrom(), "chr1");
+        assert_eq!(records[0].start(), 22);
+        assert_eq!(records[0].end(), 44);
+        assert_eq!(records[1].chrom(), "chr1");
+        assert_eq!(records[1].start(), 33);
+        assert_eq!(records[1].end(), 54);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_first_interval() -> Result<(), Box<dyn Error>> {
+        let bed_path = Path::new("tests/compr.bed.gz");
+        let mut bed_reader = BedReader::new(bed_path)?;
+
+        let records: Vec<BedRecord> = bed_reader
+            .query(0, "chr1", 1, 3)?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].chrom(), "chr1");
+        assert_eq!(records[0].start(), 1);
+        assert_eq!(records[0].end(), 10);
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_big_interval_query() -> Result<(), Box<dyn Error>> {
+        let bed_path = Path::new("tests/compr.bed.gz");
+        let mut bed_reader = BedReader::new(bed_path)?;
+
+        let records: Vec<BedRecord> = bed_reader
+            .query(0, "chr1", 999998, 999999)?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(records.len(), 1);
         Ok(())
     }
 }
