@@ -177,9 +177,9 @@ impl BedIndex {
 }
 
 /// Represents different types of readers for BED files
-enum BedReaderType<R: Read> {
+enum BedReaderType<R: BufRead> {
     Plain(BufReader<R>),
-    Gzip(BufReader<GzDecoder<BufReader<R>>>),
+    Gzip(BufReader<GzDecoder<R>>),
     Bgzf(bgzf::Reader<BufReader<R>>),
 }
 
