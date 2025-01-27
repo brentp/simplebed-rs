@@ -59,12 +59,17 @@
 
 use flate2::read::GzDecoder;
 use noodles::bgzf;
-use noodles::csi;
 
 use noodles::tabix;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
+
+use noodles::bgzf::VirtualPosition;
+use noodles::core::{Position, Region};
+use noodles::csi::BinningIndex;
+use noodles::csi::{self as csi, binning_index::index::reference_sequence::bin::Chunk};
+use std::ops::Bound;
 
 pub mod value;
 pub use value::BedValue;
@@ -144,11 +149,28 @@ pub enum BedError {
     IoError(#[from] std::io::Error),
 }
 
+/// Represents the type of index available for the BED file
+#[derive(Debug)]
+enum BedIndex {
+    Tabix(tabix::Index),
+    Csi(csi::Index),
+    None,
+}
+
+impl BedIndex {
+    fn query(&self, tid: usize, region: &Region) -> io::Result<Vec<Chunk>> {
+        match self {
+            BedIndex::Tabix(index) => index.query(tid, region.interval()),
+            BedIndex::Csi(index) => index.query(tid, region.interval()),
+            _ => unimplemented!(),
+        }
+    }
+}
+
 /// A reader for BED files, supporting plain text, BGZF compression, and tabix indexing.
 pub struct BedReader {
     reader: Box<dyn BufRead>,
-    tbx: Option<tabix::Index>,
-    csi: Option<csi::Index>,
+    index: BedIndex,
 }
 
 impl BedReader {
@@ -177,23 +199,20 @@ impl BedReader {
         reader: Box<dyn BufRead>,
         path: P,
     ) -> Result<BedReader, Box<dyn std::error::Error>> {
-        let mut br = BedReader {
-            reader: reader,
-            tbx: None,
-            csi: None,
-        };
         let path = path.as_ref();
-        if let Ok(csi_file) = File::open(format!("{}.csi", path.display())) {
+        let index = if let Ok(csi_file) = File::open(format!("{}.csi", path.display())) {
             let csi_reader = BufReader::new(Box::new(csi_file));
             let mut csi = csi::io::Reader::new(csi_reader);
-            br.csi = Some(csi.read_index()?);
+            BedIndex::Csi(csi.read_index()?)
         } else if let Ok(tbx_file) = File::open(format!("{}.tbi", path.display())) {
             let tbx_reader = BufReader::new(Box::new(tbx_file));
             let mut tbx = tabix::io::Reader::new(tbx_reader);
-            br.tbx = Some(tbx.read_index()?);
-        }
+            BedIndex::Tabix(tbx.read_index()?)
+        } else {
+            BedIndex::None
+        };
 
-        Ok(br)
+        Ok(BedReader { reader, index })
     }
 
     /// Reads a single `BedRecord` from the reader.
@@ -261,6 +280,67 @@ impl BedReader {
     pub fn records(&mut self) -> Records<'_> {
         Records { reader: self }
     }
+
+    /// Query the BED file for records overlapping the given region.
+    ///
+    /// # Arguments
+    ///
+    /// * `tid` - Target ID (reference sequence index)
+    /// * `chrom` - Chromosome name
+    /// * `start` - Start position (0-based)
+    /// * `stop` - Stop position (exclusive)
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use simplebed::BedReader;
+    /// use std::path::Path;
+    ///
+    /// let bed_path = Path::new("test.bed.gz");
+    /// let mut reader = BedReader::new(bed_path)?;
+    ///
+    /// // Query chromosome 1 starting at position 1000 and ending at position 2000
+    /// for record in reader.query(0, "chr1", 1000, 2000)? {
+    ///     let record = record?;
+    ///     println!("{:?}", record);
+    /// }
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn query(
+        &mut self,
+        tid: usize,
+        chrom: &str,
+        start: usize,
+        stop: usize,
+    ) -> Result<QueryRecords<'_>, BedError> {
+        // Check if we have an index
+        if matches!(self.index, BedIndex::None) {
+            return Err(BedError::InvalidFormat(
+                "No index found. File must be indexed with tabix or CSI.".to_string(),
+            ));
+        }
+
+        // Create a region query
+        let start = Position::try_from(start).map_err(|e| {
+            BedError::ParseError(format!("Invalid start coordinate: {}. Error: {}", start, e))
+        })?;
+        let stop = Position::try_from(stop).map_err(|e| {
+            BedError::ParseError(format!("Invalid stop coordinate: {}. Error: {}", stop, e))
+        })?;
+        let region = Region::new(chrom.to_string(), start..=stop);
+
+        // Get chunks that overlap this region
+        let chunks = self
+            .index
+            .query(tid, &region)
+            .map_err(|e| BedError::IoError(e))?;
+
+        Ok(QueryRecords {
+            reader: self,
+            chunks,
+            region: region.clone(),
+        })
+    }
 }
 
 /// An iterator over the records in a BED file.
@@ -276,6 +356,47 @@ impl<'a> Iterator for Records<'a> {
             match self.reader.read_record() {
                 Ok(Some(record)) => return Some(Ok(record)),
                 Ok(None) => return None, // EOF
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+}
+
+/// An iterator over query results from a BED file.
+pub struct QueryRecords<'a> {
+    reader: &'a mut BedReader,
+    chunks: Vec<Chunk>,
+    region: Region,
+}
+
+impl<'a> Iterator for QueryRecords<'a> {
+    type Item = Result<BedRecord, BedError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.reader.read_record() {
+                Ok(Some(record)) => {
+                    // Check if record overlaps query region
+                    if record.chrom() == self.region.name()
+                        && record.end()
+                            > match self.region.start() {
+                                Bound::Included(pos) => pos.get() as u64,
+                                Bound::Excluded(pos) => pos.get() as u64,
+                                Bound::Unbounded => 0,
+                            }
+                        && record.start()
+                            < match self.region.end() {
+                                Bound::Included(pos) => pos.get() as u64,
+                                Bound::Excluded(pos) => pos.get() as u64,
+                                Bound::Unbounded => u64::MAX,
+                            }
+                    {
+                        return Some(Ok(record));
+                    }
+                    // Keep reading until we find an overlapping record
+                    continue;
+                }
+                Ok(None) => return None,
                 Err(e) => return Some(Err(e)),
             }
         }
