@@ -327,7 +327,7 @@ impl BedReader {
                 // Create an iterator that converts Record to BedRecord
                 let iter = BedRecordIterator {
                     inner: q,
-                    region: &self.current_region.as_ref().unwrap(),
+                    //region: &self.current_region.as_ref().unwrap(),
                 };
                 Ok(iter)
             }
@@ -395,19 +395,19 @@ fn detect_compression<R: std::io::BufRead>(
 }
 
 // Add this new struct to convert Record to BedRecord
-struct BedRecordIterator<'r, I>
+struct BedRecordIterator<I>
 where
-    I: Iterator<Item = io::Result<Record>> + 'r,
+    I: Iterator<Item = io::Result<Record>>,
 {
     inner: I,
-    region: &'r Region,
+    //region: &'r Region,
 }
 
 use noodles::csi::io::indexed_records::Record;
 
-impl<'r, I> Iterator for BedRecordIterator<'r, I>
+impl<I> Iterator for BedRecordIterator<I>
 where
-    I: Iterator<Item = io::Result<Record>> + 'r,
+    I: Iterator<Item = io::Result<Record>>,
 {
     type Item = io::Result<BedRecord>;
 
