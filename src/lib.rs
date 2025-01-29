@@ -65,78 +65,19 @@ use noodles::core::{Position, Region};
 use noodles::csi::BinningIndex;
 use noodles::csi::{self as csi, binning_index::index::reference_sequence::bin::Chunk};
 use noodles::tabix;
+use std::any::Any;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek};
-use std::ops::Bound;
 use std::path::Path;
 
 pub mod value;
 pub use value::BedValue;
 
-pub mod writer;
-pub use writer::BedWriter;
+pub mod record;
+pub use record::BedRecord;
 
-/// Represents a BED record.
-#[derive(Debug, Clone, PartialEq)]
-pub struct BedRecord {
-    chrom: String,
-    start: u64,
-    end: u64,
-    name: Option<String>,
-    score: Option<f64>,
-    other_fields: Vec<BedValue>,
-}
-
-impl BedRecord {
-    /// Creates a new `BedRecord`.
-    pub fn new(
-        chrom: String,
-        start: u64,
-        end: u64,
-        name: Option<String>,
-        score: Option<f64>,
-        other_fields: Vec<BedValue>,
-    ) -> Self {
-        BedRecord {
-            chrom,
-            start,
-            end,
-            name,
-            score,
-            other_fields,
-        }
-    }
-
-    /// Returns the chromosome.
-    pub fn chrom(&self) -> &str {
-        &self.chrom
-    }
-
-    /// Returns the start coordinate (0-based).
-    pub fn start(&self) -> u64 {
-        self.start
-    }
-
-    /// Returns the end coordinate (exclusive).
-    pub fn end(&self) -> u64 {
-        self.end
-    }
-
-    /// Returns the name, if present.
-    pub fn name(&self) -> Option<&str> {
-        self.name.as_deref()
-    }
-
-    /// Returns the score, if present.
-    pub fn score(&self) -> Option<f64> {
-        self.score
-    }
-
-    /// Returns a slice of the other fields.
-    pub fn other_fields(&self) -> &[BedValue] {
-        &self.other_fields
-    }
-}
+//pub mod writer;
+//pub use writer::BedWriter;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BedError {
@@ -176,7 +117,7 @@ impl BedIndex {
 }
 
 /// Represents different types of readers for BED files
-enum BedReaderType<R: Read + Seek> {
+pub enum BedReaderType<R: Read + Seek> {
     Plain(BufReader<R>),
     Gzip(GzDecoder<BufReader<R>>),
     Bgzf(bgzf::Reader<BufReader<R>>),
@@ -196,6 +137,7 @@ impl BedReaderType<File> {
 pub struct BedReader {
     reader: BedReaderType<File>,
     index: BedIndex,
+    current_region: Option<Region>,
 }
 
 impl BedReader {
@@ -245,7 +187,11 @@ impl BedReader {
             BedIndex::None
         };
 
-        Ok(BedReader { reader, index })
+        Ok(BedReader {
+            reader,
+            index,
+            current_region: None,
+        })
     }
 
     /// Reads a single `BedRecord` from the reader.
@@ -261,7 +207,10 @@ impl BedReader {
         if line.starts_with('#') || line.is_empty() {
             return self.read_record(); // Skip comments and empty lines
         }
+        return Self::parse_line(line);
+    }
 
+    fn parse_line(line: &str) -> Result<Option<BedRecord>, BedError> {
         let fields: Vec<&str> = line.split('\t').collect();
 
         if fields.len() < 3 {
@@ -362,17 +311,25 @@ impl BedReader {
         let stop = Position::try_from(stop).map_err(|e| {
             BedError::ParseError(format!("Invalid stop coordinate: {}. Error: {}", stop, e))
         })?;
-        let region = Region::new(chrom.to_string(), start..=stop);
+        self.current_region = Some(Region::new(chrom.to_string(), start..=stop));
 
         // Get chunks that overlap this region
-        let qchunks = self.index.query(tid, &region);
+        let qchunks = self.index.query(tid, self.current_region.as_ref().unwrap());
 
-        match (qchunks, self.reader) {
+        match (qchunks, &mut self.reader) {
             (Some(Ok(chunks)), BedReaderType::Bgzf(ref mut reader)) => {
-                let q = csi::io::Query::new(&mut reader, chunks);
+                let q = csi::io::Query::new(reader, chunks);
                 let header = self.index.header().expect("No header found");
-                let q = q.indexed_records(&header).filter_by_region(&region);
-                Ok(q)
+                let q = q
+                    .indexed_records(&header)
+                    .filter_by_region(&self.current_region.as_ref().unwrap());
+
+                // Create an iterator that converts Record to BedRecord
+                let iter = BedRecordIterator {
+                    inner: q,
+                    region: &self.current_region.as_ref().unwrap(),
+                };
+                Ok(iter)
             }
             _ => unimplemented!(),
         }
@@ -398,11 +355,6 @@ impl<'a> Iterator for Records<'a> {
     }
 }
 
-/// An iterator over query results from a BED file.
-pub struct QueryRecords<'a> {
-    reader: &'a mut BedReader,
-}
-
 #[derive(Debug, PartialEq)]
 enum Compression {
     BGZF,
@@ -411,13 +363,11 @@ enum Compression {
     None,
 }
 
-fn detect_compression<R: std::io::Read>(
+fn detect_compression<R: std::io::BufRead>(
     reader: &mut R,
 ) -> Result<Compression, Box<dyn std::error::Error>> {
-    let mut breader = BufReader::new(reader);
-    let buf = breader.fill_buf()?;
+    let buf = reader.fill_buf()?;
     let mut dec_buf = vec![0u8; buf.len()];
-    use std::io::Read;
 
     let is_gzipped = &buf[0..2] == b"\x1f\x8b";
 
@@ -441,6 +391,47 @@ fn detect_compression<R: std::io::Read>(
         Ok(Compression::GZ)
     } else {
         Ok(Compression::None)
+    }
+}
+
+// Add this new struct to convert Record to BedRecord
+struct BedRecordIterator<'r, I, R>
+where
+    I: Iterator<Item = io::Result<R>> + 'r,
+    R: csi::io::IndexedRecord + Any,
+{
+    inner: I,
+    region: &'r Region,
+}
+
+use noodles::csi::io::indexed_records::Record;
+
+impl<'r, I, R> Iterator for BedRecordIterator<'r, I, R>
+where
+    I: Iterator<Item = io::Result<R>> + 'r,
+    R: csi::io::IndexedRecord + Any,
+{
+    type Item = io::Result<BedRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|result| {
+            result.and_then(|record| {
+                // Use Any::downcast_ref directly
+                if let Some(concrete_record) = (&record as &dyn Any).downcast_ref::<Record>() {
+                    let buf = concrete_record.as_ref();
+                    let record = BedReader::parse_line(buf)
+                        .expect("Failed to parse line")
+                        .expect("Failed to parse line");
+
+                    Ok(record)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Failed to downcast to concrete Record type",
+                    ))
+                }
+            })
+        })
     }
 }
 
