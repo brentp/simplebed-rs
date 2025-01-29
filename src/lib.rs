@@ -395,10 +395,9 @@ fn detect_compression<R: std::io::BufRead>(
 }
 
 // Add this new struct to convert Record to BedRecord
-struct BedRecordIterator<'r, I, R>
+struct BedRecordIterator<'r, I>
 where
-    I: Iterator<Item = io::Result<R>> + 'r,
-    R: csi::io::IndexedRecord + Any,
+    I: Iterator<Item = io::Result<Record>> + 'r,
 {
     inner: I,
     region: &'r Region,
@@ -406,30 +405,21 @@ where
 
 use noodles::csi::io::indexed_records::Record;
 
-impl<'r, I, R> Iterator for BedRecordIterator<'r, I, R>
+impl<'r, I> Iterator for BedRecordIterator<'r, I>
 where
-    I: Iterator<Item = io::Result<R>> + 'r,
-    R: csi::io::IndexedRecord + Any,
+    I: Iterator<Item = io::Result<Record>> + 'r,
 {
     type Item = io::Result<BedRecord>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|result| {
             result.and_then(|record| {
-                // Use Any::downcast_ref directly
-                if let Some(concrete_record) = (&record as &dyn Any).downcast_ref::<Record>() {
-                    let buf = concrete_record.as_ref();
-                    let record = BedReader::parse_line(buf)
-                        .expect("Failed to parse line")
-                        .expect("Failed to parse line");
+                let buf = record.as_ref();
+                let record = BedReader::parse_line(buf)
+                    .expect("Failed to parse line")
+                    .expect("Failed to parse line");
 
-                    Ok(record)
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Failed to downcast to concrete Record type",
-                    ))
-                }
+                Ok(record)
             })
         })
     }
