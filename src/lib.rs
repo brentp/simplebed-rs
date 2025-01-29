@@ -12,7 +12,7 @@
 //!     use simplebed::{BedRecord,BedValue,BedReader,BedWriter};
 //!     // Reading a BED file
 //!     let bed_path = std::path::Path::new("tests/test.bed");
-//!     let mut bed_reader = BedReader::new(bed_path)?;
+//!     let mut bed_reader = BedReader::from_path(bed_path)?;
 //!
 //!     // Writing to a BGZF compressed file
 //!     let output_path = std::path::Path::new("output.bed.gz"); // .gz extension enables BGZF compression
@@ -65,7 +65,6 @@ use noodles::core::{Position, Region};
 use noodles::csi::BinningIndex;
 use noodles::csi::{self as csi, binning_index::index::reference_sequence::bin::Chunk};
 use noodles::tabix;
-use std::any::Any;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::path::Path;
@@ -76,8 +75,8 @@ pub use value::BedValue;
 pub mod record;
 pub use record::BedRecord;
 
-//pub mod writer;
-//pub use writer::BedWriter;
+pub mod writer;
+pub use writer::BedWriter;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BedError {
@@ -207,7 +206,7 @@ impl BedReader {
         if line.starts_with('#') || line.is_empty() {
             return self.read_record(); // Skip comments and empty lines
         }
-        return Self::parse_line(line);
+        Self::parse_line(line)
     }
 
     fn parse_line(line: &str) -> Result<Option<BedRecord>, BedError> {
@@ -259,7 +258,7 @@ impl BedReader {
     }
 
     /// Returns an iterator over the records in the BED file.
-    pub fn records<'a>(&'a mut self) -> Records<'a> {
+    pub fn records(&mut self) -> Records {
         Records { reader: self }
     }
 }
@@ -281,7 +280,7 @@ impl BedReader {
     /// use std::path::Path;
     ///
     /// let bed_path = Path::new("test.bed.gz");
-    /// let mut reader = BedReader::new(bed_path)?;
+    /// let mut reader = BedReader::from_path(bed_path)?;
     ///
     /// // Query chromosome 1 starting at position 1000 and ending at position 2000
     /// for record in reader.query(0, "chr1", 1000, 2000)? {
@@ -321,8 +320,8 @@ impl BedReader {
                 let q = csi::io::Query::new(reader, chunks);
                 let header = self.index.header().expect("No header found");
                 let q = q
-                    .indexed_records(&header)
-                    .filter_by_region(&self.current_region.as_ref().unwrap());
+                    .indexed_records(header)
+                    .filter_by_region(self.current_region.as_ref().unwrap());
 
                 // Create an iterator that converts Record to BedRecord
                 let iter = BedRecordIterator {
@@ -341,21 +340,20 @@ pub struct Records<'a> {
     reader: &'a mut BedReader,
 }
 
-impl<'a> Iterator for Records<'a> {
+impl Iterator for Records<'_> {
     type Item = Result<BedRecord, BedError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            match self.reader.read_record() {
-                Ok(Some(record)) => return Some(Ok(record)),
-                Ok(None) => return None, // EOF
-                Err(e) => return Some(Err(e)),
-            }
+        match self.reader.read_record() {
+            Ok(Some(record)) => Some(Ok(record)),
+            Ok(None) => None, // EOF
+            Err(e) => Some(Err(e)),
         }
     }
 }
 
 #[derive(Debug, PartialEq)]
+#[allow(clippy::upper_case_acronyms)]
 enum Compression {
     BGZF,
     RAZF,
@@ -413,13 +411,11 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|result| {
-            result.and_then(|record| {
+            result.map(|record| {
                 let buf = record.as_ref();
-                let record = BedReader::parse_line(buf)
+                BedReader::parse_line(buf)
                     .expect("Failed to parse line")
-                    .expect("Failed to parse line");
-
-                Ok(record)
+                    .expect("Failed to parse line")
             })
         })
     }
@@ -427,7 +423,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::{BedReader, BedRecord, BedValue, BufRead};
+    use crate::{BedReader, BedRecord, BedValue};
     use std::error::Error;
     use std::path::Path;
 

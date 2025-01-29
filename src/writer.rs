@@ -1,9 +1,9 @@
-use std::io::Write;
 use crate::BedError;
 use crate::BedRecord;
 use noodles::bgzf;
-use std::path::Path;
 use std::fs::File;
+use std::io::Write;
+use std::path::Path;
 
 /// A writer for BED files, supporting plain text and BGZF compression.
 pub struct BedWriter {
@@ -16,7 +16,8 @@ impl BedWriter {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, BedError> {
         let path_ref = path.as_ref();
         let file = File::create(path_ref)?;
-        let writer: Box<dyn Write> = if path_ref.extension().and_then(|s| s.to_str()) == Some("gz") {
+        let writer: Box<dyn Write> = if path_ref.extension().and_then(|s| s.to_str()) == Some("gz")
+        {
             let bgzf_writer = bgzf::Writer::new(file);
             Box::new(bgzf_writer) // Box the Writer<bgzf::Writer>
         } else {
@@ -24,7 +25,6 @@ impl BedWriter {
         };
         Self::from_writer(writer)
     }
-
 
     /// Creates a new `BedWriter` from a writer.
     pub fn from_writer(writer: Box<dyn Write>) -> Result<Self, BedError> {
@@ -63,10 +63,9 @@ impl BedWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{BedReader, BedRecord, BedValue};
     use std::error::Error;
-    use crate::{BedRecord, BedReader, BedValue};
     use std::fs;
-    use std::io::{BufReader};
 
     #[test]
     fn test_write_bed_file() -> Result<(), Box<dyn Error>> {
@@ -83,23 +82,15 @@ mod tests {
         );
         bed_writer.write_record(&record1)?;
 
-        let record2 = BedRecord::new(
-            "chr2".to_string(),
-            300,
-            400,
-            None,
-            None,
-            vec![],
-        );
+        let record2 = BedRecord::new("chr2".to_string(), 300, 400, None, None, vec![]);
         bed_writer.write_record(&record2)?;
         bed_writer.flush()?;
 
-        let mut bed_reader = BedReader::new(output_path)?;
+        let mut bed_reader = BedReader::from_path(output_path)?;
         let read_record1 = bed_reader.read_record()?.unwrap();
         assert_eq!(read_record1, record1);
         let read_record2 = bed_reader.read_record()?.unwrap();
         assert_eq!(read_record2, record2);
-
 
         fs::remove_file(output_path)?; // Cleanup test file
         Ok(())
@@ -120,18 +111,11 @@ mod tests {
         );
         bed_writer.write_record(&record1)?;
 
-        let record2 = BedRecord::new(
-            "chr2".to_string(),
-            300,
-            400,
-            None,
-            None,
-            vec![],
-        );
+        let record2 = BedRecord::new("chr2".to_string(), 300, 400, None, None, vec![]);
         bed_writer.write_record(&record2)?;
         bed_writer.flush()?;
 
-        let mut bed_reader = BedReader::new(output_path)?;
+        let mut bed_reader = BedReader::from_path(output_path)?;
         let read_record1 = bed_reader.read_record()?.unwrap();
         assert_eq!(read_record1, record1);
         let read_record2 = bed_reader.read_record()?.unwrap();
