@@ -18,3 +18,7 @@ criterion = "0.5.1"
 [[bench]]
 name = "skipindex"
 harness = false
+
+[[bench]]
+name = "parse_line"
+harness = false

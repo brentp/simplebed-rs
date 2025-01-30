@@ -147,54 +147,6 @@ pub struct BedReader<R: Read> {
 }
 
 impl<R: Read> BedReader<R> {
-    fn parse_line(line: &str) -> Result<Option<BedRecord>, BedError> {
-        let fields: Vec<&str> = line.split('\t').collect();
-
-        if fields.len() < 3 {
-            return Err(BedError::InvalidFormat(
-                "BED format requires at least 3 columns (chrom, start, end)".to_string(),
-            ));
-        }
-
-        let chrom = fields[0].to_string();
-        let start = fields[1].parse::<u64>().map_err(|e| {
-            BedError::ParseError(format!(
-                "Invalid start coordinate: {}. Error: {}",
-                fields[1], e
-            ))
-        })?;
-        let end = fields[2].parse::<u64>().map_err(|e| {
-            BedError::ParseError(format!(
-                "Invalid end coordinate: {}. Error: {}",
-                fields[2], e
-            ))
-        })?;
-
-        let mut name = None;
-        if fields.len() > 3 && !fields[3].is_empty() {
-            name = Some(fields[3].to_string());
-        }
-
-        let mut score = None;
-        if fields.len() > 4 && !fields[4].is_empty() {
-            score = fields[4].parse::<f64>().ok();
-        }
-
-        let mut other_fields = Vec::new();
-        for field in fields.iter().skip(5) {
-            other_fields.push(BedValue::parse(field));
-        }
-
-        Ok(Some(BedRecord::new(
-            chrom,
-            start,
-            end,
-            name,
-            score,
-            other_fields,
-        )))
-    }
-
     /// Set the chromosome order for the reader. Used for query without index.
     pub fn set_chromosome_order(&mut self, chromosome_order: HashMap<String, usize>) {
         self.chromosome_order = Some(chromosome_order);
@@ -213,7 +165,7 @@ impl<R: Read> BedReader<R> {
         if line.starts_with('#') || line.is_empty() {
             return self.read_record(); // Skip comments and empty lines
         }
-        BedReader::<R>::parse_line(line)
+        BedRecord::parse_line(line)
     }
 
     /// Returns an iterator over the records in the BED file.
@@ -578,7 +530,7 @@ impl<R: BufRead> Iterator for LinearScanIterator<'_, R> {
                 continue; // Skip comments and empty lines
             }
 
-            let record = match BedReader::<R>::parse_line(line) {
+            let record = match BedRecord::parse_line(line) {
                 Ok(Some(rec)) => rec,
                 Ok(None) => continue,
                 Err(e) => return Some(Err(e)),
@@ -699,9 +651,9 @@ where
             result
                 .map(|record| {
                     let buf = record.as_ref();
-                    BedReader::<std::io::Empty>::parse_line(buf)
+                    BedRecord::parse_line(buf)
                         .expect("Failed to parse line")
-                        .expect("Failed to parse line")
+                        .expect("Empty line to parse line")
                 })
                 .map_err(BedError::IoError)
         })

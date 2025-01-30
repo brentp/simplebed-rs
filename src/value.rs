@@ -15,7 +15,7 @@ pub enum BedValue {
 impl BedValue {
     /// Attempts to parse a string slice into a `BedValue`.
     /// Tries parsing as Int, then Float, then falls back to String.
-    pub fn parse(s: &str) -> Self {
+    pub(crate) fn parse(s: &str) -> Self {
         if let Ok(int_val) = s.parse::<i64>() {
             BedValue::Integer(int_val)
         } else if let Ok(float_val) = s.parse::<f64>() {
