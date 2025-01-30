@@ -16,6 +16,10 @@
 //!     let bed_path = std::path::Path::new("tests/test.bed");
 //!     let mut bed_reader = BedReader::<File>::from_path(bed_path)?;
 //!
+//!     // the chromosome order makes sure the chromsome order is as expected when querying without an index.
+//!     let chromosome_order = HashMap::from([("chr1".to_string(), 0), ("chr2".to_string(), 1)]);
+//!     bed_reader.set_chromosome_order(chromosome_order);
+//!
 //!     // Writing to a BGZF compressed file
 //!     let output_path = std::path::Path::new("output.bed.gz"); // .gz extension enables BGZF compression
 //!     let mut bed_writer = BedWriter::new(output_path)?;
@@ -144,6 +148,7 @@ pub struct BedReader<R: Read> {
     current_region: Option<Region>,
     chromosome_order: Option<HashMap<String, usize>>,
     skip_index: Option<SkipIndex>,
+    buf: String,
 }
 
 impl<R: Read> BedReader<R> {
@@ -154,13 +159,13 @@ impl<R: Read> BedReader<R> {
 
     /// Reads a single `BedRecord` from the reader.
     pub fn read_record(&mut self) -> Result<Option<BedRecord>, BedError> {
-        let mut line = String::new();
-        let bytes_read = self.reader.read_line(&mut line)?;
+        self.buf.clear();
+        let bytes_read = self.reader.read_line(&mut self.buf)?;
         if bytes_read == 0 {
             return Ok(None); // EOF
         }
 
-        let line = line.trim_end(); // Remove trailing newline
+        let line = self.buf.trim_end(); // Remove trailing newline
 
         if line.starts_with('#') || line.is_empty() {
             return self.read_record(); // Skip comments and empty lines
@@ -222,6 +227,7 @@ impl<R: Read> BedReader<R> {
             current_region: None,
             chromosome_order: None,
             skip_index: None,
+            buf: String::new(),
         })
     }
 }
@@ -233,7 +239,6 @@ impl<R: Read + Seek> BedReader<R> {
     ///
     /// # Arguments
     ///
-    /// * `tid` - Target ID (reference sequence index)
     /// * `chrom` - Chromosome name
     /// * `start` - Start position (0-based)
     /// * `stop` - Stop position (exclusive)
@@ -260,15 +265,6 @@ impl<R: Read + Seek> BedReader<R> {
         start: usize,
         stop: usize,
     ) -> Result<Box<dyn Iterator<Item = Result<BedRecord, BedError>> + 'r>, BedError> {
-        /*
-        // Check if we have an index, otherwise fallback to linear scan
-        if !matches!(self.index, BedIndex::None) {
-            return Err(BedError::InvalidFormat(
-                "Index found but not used in this implementation.".to_string(),
-            ));
-        }
-        */
-
         let tid = if let Some(chrom_order) = &self.chromosome_order {
             match chrom_order.get(chrom) {
                 Some(order) => Ok(*order),
@@ -295,25 +291,13 @@ impl<R: Read + Seek> BedReader<R> {
         // or we are on same chrom but the new start is before the current end,
         // try to seek to the approximate position
         if let Some(skip_index) = &self.skip_index {
-            if self.current_region.is_none()
-                || self.current_region.as_ref().unwrap().name() != chrom
-                || self
-                    .current_region
-                    .as_ref()
-                    .unwrap()
-                    .interval()
-                    .end()
-                    .unwrap()
-                    > start_pos
-            {
-                let tid = tid.as_ref().unwrap(); // we know we have tid since we checked it above
-                if let Some(seek_pos) = skip_index.find_seek_position(*tid) {
-                    match &mut self.reader {
-                        BedReaderType::Plain(reader) => {
-                            reader.seek(std::io::SeekFrom::Start(seek_pos))?;
-                        }
-                        _ => unreachable!(),
+            let tid = tid.as_ref().unwrap(); // we know we have tid since we checked it above
+            if let Some(seek_pos) = skip_index.find_seek_position(*tid) {
+                match &mut self.reader {
+                    BedReaderType::Plain(reader) => {
+                        reader.seek(std::io::SeekFrom::Start(seek_pos))?;
                     }
+                    _ => unreachable!(),
                 }
             }
         }
