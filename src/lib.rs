@@ -12,6 +12,7 @@
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     use simplebed::{BedRecord,BedValue,BedReader,BedWriter};
 //!     use std::fs::File;
+//!     use std::collections::HashMap;
 //!     // Reading a BED file
 //!     let bed_path = std::path::Path::new("tests/test.bed");
 //!     let mut bed_reader = BedReader::<File>::from_path(bed_path)?;
