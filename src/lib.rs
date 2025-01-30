@@ -57,7 +57,7 @@
 //!   supporting String, Integer, and Float types.
 //! * **Performance-oriented:** Uses buffered reading and efficient string parsing for speed.
 
-use flate2::read::GzDecoder;
+use flate2::bufread::GzDecoder;
 use noodles::bgzf;
 
 //use noodles::bgzf::io::{BufRead, Read, Seek};
@@ -65,10 +65,11 @@ use noodles::core::{Position, Region};
 use noodles::csi::BinningIndex;
 use noodles::csi::{self as csi, binning_index::index::reference_sequence::bin::Chunk};
 use noodles::tabix;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek};
+use std::marker::PhantomData;
 use std::path::Path;
-
 pub mod value;
 pub use value::BedValue;
 
@@ -86,6 +87,8 @@ pub enum BedError {
     ParseError(String),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+    #[error("No chromosome order found.")]
+    NoChromosomeOrder,
 }
 
 /// Represents the type of index available for the BED file
@@ -118,25 +121,37 @@ impl BedIndex {
 /// Represents different types of readers for BED files
 pub enum BedReaderType<R: Read + Seek> {
     Plain(BufReader<R>),
-    Gzip(GzDecoder<BufReader<R>>),
+    Gzip(BufReader<GzDecoder<BufReader<R>>>), // Wrap GzDecoder in BufReader
     Bgzf(bgzf::Reader<BufReader<R>>),
+}
+
+impl std::fmt::Debug for BedReaderType<File> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BedReaderType::Plain(_reader) => write!(f, "Plain(reader)"),
+            BedReaderType::Gzip(_reader) => write!(f, "Gzip(reader)"),
+            BedReaderType::Bgzf(_reader) => write!(f, "Bgzf(reader)"),
+        }
+    }
 }
 
 impl BedReaderType<File> {
     fn read_line(&mut self, buf: &mut String) -> io::Result<usize> {
         match self {
             BedReaderType::Plain(reader) => reader.read_line(buf),
-            BedReaderType::Gzip(reader) => reader.get_mut().read_line(buf),
+            BedReaderType::Gzip(reader) => reader.read_line(buf), // Now works with BufReader
             BedReaderType::Bgzf(reader) => reader.read_line(buf),
         }
     }
 }
 
 /// A reader for BED files, supporting plain text, BGZF compression, and tabix indexing.
+#[derive(Debug)]
 pub struct BedReader {
     reader: BedReaderType<File>,
     index: BedIndex,
     current_region: Option<Region>,
+    chromosome_order: Option<HashMap<String, usize>>,
 }
 
 impl BedReader {
@@ -148,14 +163,8 @@ impl BedReader {
         let mut reader = BufReader::new(reader);
         let compression = detect_compression(&mut reader)?;
 
-        /*
-        Plain(Box<dyn BufRead>),
-        Gzip(BufReader<GzDecoder<R>>),
-        Bgzf(bgzf::Reader<BufReader<R>>),
-        */
-
         let reader = match compression {
-            Compression::GZ => BedReaderType::Gzip(GzDecoder::new(reader)),
+            Compression::GZ => BedReaderType::Gzip(BufReader::new(GzDecoder::new(reader))),
             Compression::BGZF => BedReaderType::Bgzf(bgzf::Reader::new(reader)),
             _ => BedReaderType::Plain(reader),
         };
@@ -175,11 +184,11 @@ impl BedReader {
     ) -> Result<BedReader, Box<dyn std::error::Error>> {
         let path = path.as_ref();
         let index = if let Ok(csi_file) = File::open(format!("{}.csi", path.display())) {
-            let csi_reader = BufReader::new(Box::new(csi_file));
+            let csi_reader = BufReader::new(csi_file);
             let mut csi = csi::io::Reader::new(csi_reader);
             BedIndex::Csi(csi.read_index()?)
         } else if let Ok(tbx_file) = File::open(format!("{}.tbi", path.display())) {
-            let tbx_reader = BufReader::new(Box::new(tbx_file));
+            let tbx_reader = BufReader::new(tbx_file);
             let mut tbx = tabix::io::Reader::new(tbx_reader);
             BedIndex::Tabix(tbx.read_index()?)
         } else {
@@ -190,7 +199,13 @@ impl BedReader {
             reader,
             index,
             current_region: None,
+            chromosome_order: None,
         })
+    }
+
+    /// Set the chromosome order for the reader. Used for query without index.
+    pub fn set_chromosome_order(&mut self, chromosome_order: HashMap<String, usize>) {
+        self.chromosome_order = Some(chromosome_order);
     }
 
     /// Reads a single `BedRecord` from the reader.
@@ -295,42 +310,185 @@ impl BedReader {
         chrom: &str,
         start: usize,
         stop: usize,
-    ) -> Result<impl Iterator<Item = io::Result<BedRecord>> + 'r, BedError> {
-        // Check if we have an index
-        if matches!(self.index, BedIndex::None) {
+    ) -> Result<Box<dyn Iterator<Item = Result<BedRecord, BedError>> + 'r>, BedError> {
+        /*
+        // Check if we have an index, otherwise fallback to linear scan
+        if !matches!(self.index, BedIndex::None) {
             return Err(BedError::InvalidFormat(
-                "No index found. File must be indexed with tabix or CSI.".to_string(),
+                "Index found but not used in this implementation.".to_string(),
             ));
         }
+        */
+
+        let target_chrom_order = if let Some(chrom_order) = &self.chromosome_order {
+            match chrom_order.get(chrom) {
+                Some(order) => Ok(*order),
+                None => {
+                    return Err(BedError::InvalidFormat(format!(
+                        "Chromosome {} not found in chromosome order.",
+                        chrom
+                    )))
+                }
+            }
+        } else {
+            Err(BedError::NoChromosomeOrder)
+        };
 
         // Create a region query
-        let start = Position::try_from(start).map_err(|e| {
+        let start_pos = Position::try_from(start).map_err(|e| {
             BedError::ParseError(format!("Invalid start coordinate: {}. Error: {}", start, e))
         })?;
-        let stop = Position::try_from(stop).map_err(|e| {
+        let stop_pos = Position::try_from(stop).map_err(|e| {
             BedError::ParseError(format!("Invalid stop coordinate: {}. Error: {}", stop, e))
         })?;
-        self.current_region = Some(Region::new(chrom.to_string(), start..=stop));
+        self.current_region = Some(Region::new(chrom.to_string(), start_pos..=stop_pos));
 
         // Get chunks that overlap this region
         let qchunks = self.index.query(tid, self.current_region.as_ref().unwrap());
 
-        match (qchunks, &mut self.reader) {
-            (Some(Ok(chunks)), BedReaderType::Bgzf(ref mut reader)) => {
-                let q = csi::io::Query::new(reader, chunks);
-                let header = self.index.header().expect("No header found");
-                let q = q
-                    .indexed_records(header)
-                    .filter_by_region(self.current_region.as_ref().unwrap());
+        let iter: Box<dyn Iterator<Item = Result<BedRecord, BedError>>> =
+            match (qchunks, &mut self.reader) {
+                (None, BedReaderType::Plain(reader)) => Box::new(LinearScanIterator::new(
+                    reader,
+                    target_chrom_order?,
+                    start as u64,
+                    stop as u64,
+                    self.chromosome_order
+                        .as_ref()
+                        .ok_or(BedError::NoChromosomeOrder)?,
+                )),
+                (None, BedReaderType::Gzip(reader)) => Box::new(LinearScanIterator::new(
+                    reader,
+                    target_chrom_order?,
+                    start as u64,
+                    stop as u64,
+                    self.chromosome_order
+                        .as_ref()
+                        .ok_or(BedError::NoChromosomeOrder)?,
+                )),
+                (None, BedReaderType::Bgzf(reader)) => Box::new(LinearScanIterator::new(
+                    reader,
+                    target_chrom_order?,
+                    start as u64,
+                    stop as u64,
+                    self.chromosome_order
+                        .as_ref()
+                        .ok_or(BedError::NoChromosomeOrder)?,
+                )),
+                (Some(Ok(chunks)), BedReaderType::Bgzf(ref mut reader)) => {
+                    let q = csi::io::Query::new(reader, chunks);
+                    let header = self.index.header().expect("No header found");
+                    let q = q
+                        .indexed_records(header)
+                        .filter_by_region(self.current_region.as_ref().unwrap());
 
-                // Create an iterator that converts Record to BedRecord
-                let iter = BedRecordIterator {
-                    inner: q,
-                    //region: &self.current_region.as_ref().unwrap(),
-                };
-                Ok(iter)
+                    // Create an iterator that converts Record to BedRecord
+                    let iter = BedRecordIterator {
+                        inner: q,
+                        _phantom: PhantomData,
+                        //region: &self.current_region.as_ref().unwrap(),
+                    };
+                    Box::new(iter)
+                }
+                _ => unimplemented!(),
+            };
+
+        Ok(iter)
+    }
+}
+
+struct LinearScanIterator<'a, R> {
+    reader: R,
+    target_chrom_order: usize,
+    start_pos: u64,
+    stop_pos: u64,
+    chromosome_order: &'a HashMap<String, usize>,
+    buffer: String,
+    finished: bool,
+}
+
+impl<'a, R: BufRead> LinearScanIterator<'a, R> {
+    fn new(
+        reader: R,
+        target_chrom_order: usize,
+        start_pos: u64,
+        stop_pos: u64,
+        chromosome_order: &'a HashMap<String, usize>,
+    ) -> Self {
+        LinearScanIterator {
+            reader,
+            target_chrom_order,
+            start_pos,
+            stop_pos,
+            chromosome_order,
+            buffer: String::new(),
+            finished: false,
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for LinearScanIterator<'_, R> {
+    type Item = Result<BedRecord, BedError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
+        loop {
+            self.buffer.clear();
+            let bytes_read = match self.reader.read_line(&mut self.buffer) {
+                Ok(bytes) => bytes,
+                Err(e) => return Some(Err(BedError::IoError(e))),
+            };
+
+            if bytes_read == 0 {
+                self.finished = true;
+                return None; // EOF
             }
-            _ => unimplemented!(),
+
+            let line = self.buffer.trim_end(); // Remove trailing newline
+
+            if line.starts_with('#') || line.is_empty() {
+                continue; // Skip comments and empty lines
+            }
+
+            let record = match BedReader::parse_line(line) {
+                Ok(Some(rec)) => rec,
+                Ok(None) => continue,
+                Err(e) => return Some(Err(e)),
+            };
+
+            let current_chrom_order = match self.chromosome_order.get(record.chrom()) {
+                Some(order) => *order,
+                None => {
+                    return Some(Err(BedError::InvalidFormat(format!(
+                        "Chromosome {} not found in chromosome order.",
+                        record.chrom()
+                    ))))
+                }
+            };
+
+            // If we've moved past the target chromosome, we're done
+            if current_chrom_order > self.target_chrom_order {
+                self.finished = true;
+                return None;
+            }
+
+            // Skip until we reach the target chromosome
+            if current_chrom_order < self.target_chrom_order {
+                continue;
+            }
+
+            // Now we're on the target chromosome, check positions
+            if record.start() >= self.stop_pos {
+                self.finished = true;
+                return None; // Past the target interval
+            }
+
+            if record.end() > self.start_pos {
+                return Some(Ok(record)); // Record overlaps with the target interval
+            }
         }
     }
 }
@@ -375,12 +533,14 @@ fn detect_compression<R: std::io::BufRead>(
             b"RAZF" => Compression::RAZF,
             _ => Compression::GZ,
         };
-        let mut gz = GzDecoder::new(buf);
-        match gz.read_exact(&mut dec_buf) {
-            Ok(_) => {}
-            Err(e) => {
-                if e.kind() != io::ErrorKind::UnexpectedEof {
-                    return Err(e.into());
+        if matches!(c, Compression::BGZF) {
+            let mut gz = GzDecoder::new(buf);
+            match gz.read_exact(&mut dec_buf) {
+                Ok(_) => {}
+                Err(e) => {
+                    if e.kind() != io::ErrorKind::UnexpectedEof {
+                        return Err(e.into());
+                    }
                 }
             }
         }
@@ -395,35 +555,37 @@ fn detect_compression<R: std::io::BufRead>(
 // Add this new struct to convert Record to BedRecord
 struct BedRecordIterator<I>
 where
-    I: Iterator<Item = io::Result<Record>>,
+    I: Iterator<Item = std::io::Result<Record>>,
 {
     inner: I,
-    //region: &'r Region,
+    _phantom: PhantomData<I>,
 }
 
 use noodles::csi::io::indexed_records::Record;
 
 impl<I> Iterator for BedRecordIterator<I>
 where
-    I: Iterator<Item = io::Result<Record>>,
+    I: Iterator<Item = std::io::Result<Record>>,
 {
-    type Item = io::Result<BedRecord>;
+    type Item = Result<BedRecord, BedError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|result| {
-            result.map(|record| {
-                let buf = record.as_ref();
-                BedReader::parse_line(buf)
-                    .expect("Failed to parse line")
-                    .expect("Failed to parse line")
-            })
+            result
+                .map(|record| {
+                    let buf = record.as_ref();
+                    BedReader::parse_line(buf)
+                        .expect("Failed to parse line")
+                        .expect("Failed to parse line")
+                })
+                .map_err(BedError::IoError)
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{BedReader, BedRecord, BedValue};
+    use crate::{BedReader, BedRecord, BedValue, HashMap};
     use std::error::Error;
     use std::path::Path;
 
@@ -473,6 +635,10 @@ mod tests {
     fn test_query_bed_file() -> Result<(), Box<dyn Error>> {
         let bed_path = Path::new("tests/compr.bed.gz");
         let mut bed_reader = BedReader::from_path(bed_path)?;
+        bed_reader.set_chromosome_order(HashMap::from([
+            ("chr1".to_string(), 0),
+            ("chr2".to_string(), 1),
+        ]));
 
         let records: Vec<BedRecord> = bed_reader
             .query(0, "chr1", 22, 34)?
@@ -493,6 +659,10 @@ mod tests {
     fn test_query_first_interval() -> Result<(), Box<dyn Error>> {
         let bed_path = Path::new("tests/compr.bed.gz");
         let mut bed_reader = BedReader::from_path(bed_path)?;
+        bed_reader.set_chromosome_order(HashMap::from([
+            ("chr1".to_string(), 0),
+            ("chr2".to_string(), 1),
+        ]));
 
         let records: Vec<BedRecord> = bed_reader
             .query(0, "chr1", 1, 3)?
@@ -507,7 +677,14 @@ mod tests {
     #[test]
     fn test_get_big_interval_query() -> Result<(), Box<dyn Error>> {
         let bed_path = Path::new("tests/compr.bed.gz");
+        eprintln!("starting");
         let mut bed_reader = BedReader::from_path(bed_path)?;
+        eprintln!("{:?}", bed_reader);
+        bed_reader.set_chromosome_order(HashMap::from([
+            ("chr1".to_string(), 0),
+            ("chr2".to_string(), 1),
+        ]));
+        eprintln!("{:?}", bed_reader.chromosome_order);
 
         let records: Vec<BedRecord> = bed_reader
             .query(0, "chr1", 999998, 999999)?
