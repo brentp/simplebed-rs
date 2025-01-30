@@ -1,3 +1,4 @@
+//! Represents a BED record.
 use crate::value::BedValue;
 
 /// Represents a BED record.

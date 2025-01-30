@@ -1,3 +1,4 @@
+//! A writer for BED files.
 use crate::BedError;
 use crate::BedRecord;
 use noodles::bgzf;

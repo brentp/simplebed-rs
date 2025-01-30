@@ -1,10 +1,14 @@
+//! Represents the possible data types for optional BED fields.
 use std::fmt;
 
 /// Represents the possible data types for optional BED fields.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BedValue {
+    /// A string value.
     String(String),
+    /// An integer value.
     Integer(i64),
+    /// A float value.
     Float(f64),
 }
 

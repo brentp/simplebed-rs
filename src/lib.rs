@@ -1,3 +1,4 @@
+#![warn(missing_docs)]
 //! A Rust library for reading BED files, supporting BGZF compression and performance.
 //!
 //! This library provides `BedReader` and `BedWriter` structs to efficiently parse and write BED files,
@@ -80,14 +81,19 @@ pub use record::BedRecord;
 pub mod writer;
 pub use writer::BedWriter;
 
+/// Errors available in this library.
 #[derive(Debug, thiserror::Error)]
 pub enum BedError {
+    /// Invalid BED format.
     #[error("Invalid BED format: {0}")]
     InvalidFormat(String),
+    /// Parse error.
     #[error("Parse error: {0}")]
     ParseError(String),
+    /// IO error.
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+    /// Ng no chromosome order found when querying.
     #[error("No chromosome order found.")]
     NoChromosomeOrder,
 }
@@ -121,8 +127,11 @@ impl BedIndex {
 
 /// Represents different types of readers for BED files
 pub enum BedReaderType<R: Read> {
+    /// A plain text reader.
     Plain(BufReader<R>),
+    /// A gzip compressed reader.
     Gzip(BufReader<GzDecoder<BufReader<R>>>), // Wrap GzDecoder in BufReader
+    /// A bgzf compressed reader.
     Bgzf(bgzf::Reader<BufReader<R>>),
 }
 
@@ -247,7 +256,7 @@ impl<R: Read> BedReader<R> {
         BedReader::from_reader(reader, path)
     }
 
-    // Add a new constructor for path-based creation
+    /// Creates a new `BedReader` from a file path.
     pub fn from_path<P: AsRef<Path>>(
         path: P,
     ) -> Result<BedReader<File>, Box<dyn std::error::Error>> {
@@ -255,6 +264,7 @@ impl<R: Read> BedReader<R> {
         BedReader::<File>::new(reader, path)
     }
 
+    /// Creates a new `BedReader` from a reader.
     pub fn from_reader<P: AsRef<Path>>(
         reader: BedReaderType<R>,
         path: P,
@@ -301,7 +311,7 @@ impl<R: Read + Seek> BedReader<R> {
     /// let mut reader = BedReader::<File>::from_path(bed_path)?;
     ///
     /// // Query chromosome 1 starting at position 1000 and ending at position 2000
-    /// for record in reader.query(0, "chr1", 1000, 2000)? {
+    /// for record in reader.query("chr1", 1000, 2000)? {
     ///     let record = record?;
     ///     println!("{:?}", record);
     /// }
@@ -309,7 +319,6 @@ impl<R: Read + Seek> BedReader<R> {
     /// ```
     pub fn query<'r>(
         &'r mut self,
-        tid: usize,
         chrom: &str,
         start: usize,
         stop: usize,
@@ -323,7 +332,7 @@ impl<R: Read + Seek> BedReader<R> {
         }
         */
 
-        let target_chrom_order = if let Some(chrom_order) = &self.chromosome_order {
+        let tid = if let Some(chrom_order) = &self.chromosome_order {
             match chrom_order.get(chrom) {
                 Some(order) => Ok(*order),
                 None => {
@@ -347,13 +356,17 @@ impl<R: Read + Seek> BedReader<R> {
         self.current_region = Some(Region::new(chrom.to_string(), start_pos..=stop_pos));
 
         // Get chunks that overlap this region
-        let qchunks = self.index.query(tid, self.current_region.as_ref().unwrap());
+        let qchunks = if let Ok(tid) = tid {
+            self.index.query(tid, self.current_region.as_ref().unwrap())
+        } else {
+            None
+        };
 
         let iter: Box<dyn Iterator<Item = Result<BedRecord, BedError>>> =
             match (qchunks, &mut self.reader) {
                 (None, BedReaderType::Plain(reader)) => Box::new(LinearScanIterator::new(
                     reader,
-                    target_chrom_order?,
+                    tid?,
                     start as u64,
                     stop as u64,
                     self.chromosome_order
@@ -362,7 +375,7 @@ impl<R: Read + Seek> BedReader<R> {
                 )),
                 (None, BedReaderType::Gzip(reader)) => Box::new(LinearScanIterator::new(
                     reader,
-                    target_chrom_order?,
+                    tid?,
                     start as u64,
                     stop as u64,
                     self.chromosome_order
@@ -371,7 +384,7 @@ impl<R: Read + Seek> BedReader<R> {
                 )),
                 (None, BedReaderType::Bgzf(reader)) => Box::new(LinearScanIterator::new(
                     reader,
-                    target_chrom_order?,
+                    tid?,
                     start as u64,
                     stop as u64,
                     self.chromosome_order
@@ -647,7 +660,7 @@ mod tests {
         ]));
 
         let records: Vec<BedRecord> = bed_reader
-            .query(0, "chr1", 22, 34)?
+            .query("chr1", 22, 34)?
             .collect::<Result<Vec<_>, _>>()?;
 
         assert_eq!(records.len(), 2);
@@ -671,7 +684,7 @@ mod tests {
         ]));
 
         let records: Vec<BedRecord> = bed_reader
-            .query(0, "chr1", 1, 3)?
+            .query("chr1", 1, 3)?
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].chrom(), "chr1");
@@ -693,7 +706,7 @@ mod tests {
         eprintln!("{:?}", bed_reader.chromosome_order);
 
         let records: Vec<BedRecord> = bed_reader
-            .query(0, "chr1", 999998, 999999)?
+            .query("chr1", 999998, 999999)?
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(records.len(), 1);
         Ok(())
@@ -721,7 +734,7 @@ mod tests {
         ]));
 
         let records: Vec<BedRecord> = bed_reader
-            .query(0, "chr1", 1, 3)?
+            .query("chr1", 1, 3)?
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].chrom(), "chr1");
@@ -743,7 +756,7 @@ mod tests {
         ]));
 
         let records: Vec<BedRecord> = bed_reader
-            .query(0, "chr1", 1, 3)?
+            .query("chr1", 1, 3)?
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].chrom(), "chr1");
