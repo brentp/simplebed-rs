@@ -112,11 +112,6 @@ impl SkipIndex {
         if idx == 0 {
             None
         } else {
-            eprintln!(
-                "found seek position for tid {} with entry: {:?}",
-                target_tid,
-                self.entries[idx - 1]
-            );
             Some(self.entries[idx - 1].seek_pos)
         }
     }

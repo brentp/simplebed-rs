@@ -11,3 +11,10 @@ noodles-csi = {git = "https://github.com/brentp/noodles.git", rev = "8eecb39c4"}
 noodles-tabix = "0.49.0"
 tempfile = "3.15.0"
 thiserror = "2.0.11"
+
+[dev-dependencies]
+criterion = "0.5.1"
+
+[[bench]]
+name = "skipindex"
+harness = false

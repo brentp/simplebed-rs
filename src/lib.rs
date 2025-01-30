@@ -765,7 +765,7 @@ mod tests {
         );
         bed_reader.build_skip_index()?;
         eprintln!("{:?}", bed_reader.skip_index);
-        /*
+        /* this is no longer true because we optimize the skip index
         assert_eq!(
             bed_reader.skip_index.as_ref().unwrap().entries.len(),
             crate::SKIP_CHUNKS as usize
