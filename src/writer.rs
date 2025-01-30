@@ -86,7 +86,7 @@ mod tests {
         bed_writer.write_record(&record2)?;
         bed_writer.flush()?;
 
-        let mut bed_reader = BedReader::from_path(output_path)?;
+        let mut bed_reader = BedReader::<File>::from_path(output_path)?;
         let read_record1 = bed_reader.read_record()?.unwrap();
         assert_eq!(read_record1, record1);
         let read_record2 = bed_reader.read_record()?.unwrap();
@@ -115,7 +115,7 @@ mod tests {
         bed_writer.write_record(&record2)?;
         bed_writer.flush()?;
 
-        let mut bed_reader = BedReader::from_path(output_path)?;
+        let mut bed_reader = BedReader::<File>::from_path(output_path)?;
         let read_record1 = bed_reader.read_record()?.unwrap();
         assert_eq!(read_record1, record1);
         let read_record2 = bed_reader.read_record()?.unwrap();

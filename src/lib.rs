@@ -10,9 +10,10 @@
 //! ```
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     use simplebed::{BedRecord,BedValue,BedReader,BedWriter};
+//!     use std::fs::File;
 //!     // Reading a BED file
 //!     let bed_path = std::path::Path::new("tests/test.bed");
-//!     let mut bed_reader = BedReader::from_path(bed_path)?;
+//!     let mut bed_reader = BedReader::<File>::from_path(bed_path)?;
 //!
 //!     // Writing to a BGZF compressed file
 //!     let output_path = std::path::Path::new("output.bed.gz"); // .gz extension enables BGZF compression
@@ -119,13 +120,13 @@ impl BedIndex {
 }
 
 /// Represents different types of readers for BED files
-pub enum BedReaderType<R: Read + Seek> {
+pub enum BedReaderType<R: Read> {
     Plain(BufReader<R>),
     Gzip(BufReader<GzDecoder<BufReader<R>>>), // Wrap GzDecoder in BufReader
     Bgzf(bgzf::Reader<BufReader<R>>),
 }
 
-impl std::fmt::Debug for BedReaderType<File> {
+impl<R: Read> std::fmt::Debug for BedReaderType<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BedReaderType::Plain(_reader) => write!(f, "Plain(reader)"),
@@ -135,7 +136,7 @@ impl std::fmt::Debug for BedReaderType<File> {
     }
 }
 
-impl BedReaderType<File> {
+impl<R: Read> BedReaderType<R> {
     fn read_line(&mut self, buf: &mut String) -> io::Result<usize> {
         match self {
             BedReaderType::Plain(reader) => reader.read_line(buf),
@@ -147,83 +148,14 @@ impl BedReaderType<File> {
 
 /// A reader for BED files, supporting plain text, BGZF compression, and tabix indexing.
 #[derive(Debug)]
-pub struct BedReader {
-    reader: BedReaderType<File>,
+pub struct BedReader<R: Read> {
+    reader: BedReaderType<R>,
     index: BedIndex,
     current_region: Option<Region>,
     chromosome_order: Option<HashMap<String, usize>>,
 }
 
-impl BedReader {
-    /// Creates a new `BedReader` from a BufReader.
-    pub fn new<P: AsRef<Path>>(
-        reader: File,
-        path: P,
-    ) -> Result<BedReader, Box<dyn std::error::Error>> {
-        let mut reader = BufReader::new(reader);
-        let compression = detect_compression(&mut reader)?;
-
-        let reader = match compression {
-            Compression::GZ => BedReaderType::Gzip(BufReader::new(GzDecoder::new(reader))),
-            Compression::BGZF => BedReaderType::Bgzf(bgzf::Reader::new(reader)),
-            _ => BedReaderType::Plain(reader),
-        };
-
-        BedReader::from_reader(reader, path)
-    }
-
-    // Add a new constructor for path-based creation
-    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<BedReader, Box<dyn std::error::Error>> {
-        let reader = File::open(path.as_ref())?;
-        Self::new(reader, path)
-    }
-
-    pub fn from_reader<P: AsRef<Path>>(
-        reader: BedReaderType<File>,
-        path: P,
-    ) -> Result<BedReader, Box<dyn std::error::Error>> {
-        let path = path.as_ref();
-        let index = if let Ok(csi_file) = File::open(format!("{}.csi", path.display())) {
-            let csi_reader = BufReader::new(csi_file);
-            let mut csi = csi::io::Reader::new(csi_reader);
-            BedIndex::Csi(csi.read_index()?)
-        } else if let Ok(tbx_file) = File::open(format!("{}.tbi", path.display())) {
-            let tbx_reader = BufReader::new(tbx_file);
-            let mut tbx = tabix::io::Reader::new(tbx_reader);
-            BedIndex::Tabix(tbx.read_index()?)
-        } else {
-            BedIndex::None
-        };
-
-        Ok(BedReader {
-            reader,
-            index,
-            current_region: None,
-            chromosome_order: None,
-        })
-    }
-
-    /// Set the chromosome order for the reader. Used for query without index.
-    pub fn set_chromosome_order(&mut self, chromosome_order: HashMap<String, usize>) {
-        self.chromosome_order = Some(chromosome_order);
-    }
-
-    /// Reads a single `BedRecord` from the reader.
-    pub fn read_record(&mut self) -> Result<Option<BedRecord>, BedError> {
-        let mut line = String::new();
-        let bytes_read = self.reader.read_line(&mut line)?;
-        if bytes_read == 0 {
-            return Ok(None); // EOF
-        }
-
-        let line = line.trim_end(); // Remove trailing newline
-
-        if line.starts_with('#') || line.is_empty() {
-            return self.read_record(); // Skip comments and empty lines
-        }
-        Self::parse_line(line)
-    }
-
+impl<R: Read> BedReader<R> {
     fn parse_line(line: &str) -> Result<Option<BedRecord>, BedError> {
         let fields: Vec<&str> = line.split('\t').collect();
 
@@ -272,13 +204,84 @@ impl BedReader {
         )))
     }
 
+    /// Set the chromosome order for the reader. Used for query without index.
+    pub fn set_chromosome_order(&mut self, chromosome_order: HashMap<String, usize>) {
+        self.chromosome_order = Some(chromosome_order);
+    }
+
+    /// Reads a single `BedRecord` from the reader.
+    pub fn read_record(&mut self) -> Result<Option<BedRecord>, BedError> {
+        let mut line = String::new();
+        let bytes_read = self.reader.read_line(&mut line)?;
+        if bytes_read == 0 {
+            return Ok(None); // EOF
+        }
+
+        let line = line.trim_end(); // Remove trailing newline
+
+        if line.starts_with('#') || line.is_empty() {
+            return self.read_record(); // Skip comments and empty lines
+        }
+        BedReader::<R>::parse_line(line)
+    }
+
     /// Returns an iterator over the records in the BED file.
-    pub fn records(&mut self) -> Records {
+    pub fn records(&mut self) -> Records<R> {
         Records { reader: self }
+    }
+
+    /// Creates a new `BedReader` from a BufReader.
+    pub fn new<P: AsRef<Path>>(
+        reader: R,
+        path: P,
+    ) -> Result<BedReader<R>, Box<dyn std::error::Error>> {
+        let mut reader = BufReader::new(reader);
+        let compression = detect_compression(&mut reader)?;
+
+        let reader = match compression {
+            Compression::GZ => BedReaderType::Gzip(BufReader::new(GzDecoder::new(reader))),
+            Compression::BGZF => BedReaderType::Bgzf(bgzf::Reader::new(reader)),
+            _ => BedReaderType::Plain(reader),
+        };
+
+        BedReader::from_reader(reader, path)
+    }
+
+    // Add a new constructor for path-based creation
+    pub fn from_path<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<BedReader<File>, Box<dyn std::error::Error>> {
+        let reader = File::open(path.as_ref())?;
+        BedReader::<File>::new(reader, path)
+    }
+
+    pub fn from_reader<P: AsRef<Path>>(
+        reader: BedReaderType<R>,
+        path: P,
+    ) -> Result<BedReader<R>, Box<dyn std::error::Error>> {
+        let path = path.as_ref();
+        let index = if let Ok(csi_file) = File::open(format!("{}.csi", path.display())) {
+            let csi_reader = BufReader::new(csi_file);
+            let mut csi = csi::io::Reader::new(csi_reader);
+            BedIndex::Csi(csi.read_index()?)
+        } else if let Ok(tbx_file) = File::open(format!("{}.tbi", path.display())) {
+            let tbx_reader = BufReader::new(tbx_file);
+            let mut tbx = tabix::io::Reader::new(tbx_reader);
+            BedIndex::Tabix(tbx.read_index()?)
+        } else {
+            BedIndex::None
+        };
+
+        Ok(BedReader {
+            reader,
+            index,
+            current_region: None,
+            chromosome_order: None,
+        })
     }
 }
 
-impl BedReader {
+impl<R: Read + Seek> BedReader<R> {
     /// Query the BED file for records overlapping the given region.
     ///
     /// # Arguments
@@ -292,10 +295,10 @@ impl BedReader {
     ///
     /// ```no_run
     /// use simplebed::BedReader;
-    /// use std::path::Path;
+    /// use std::{path::Path, fs::File};
     ///
     /// let bed_path = Path::new("test.bed.gz");
-    /// let mut reader = BedReader::from_path(bed_path)?;
+    /// let mut reader = BedReader::<File>::from_path(bed_path)?;
     ///
     /// // Query chromosome 1 starting at position 1000 and ending at position 2000
     /// for record in reader.query(0, "chr1", 1000, 2000)? {
@@ -453,7 +456,7 @@ impl<R: BufRead> Iterator for LinearScanIterator<'_, R> {
                 continue; // Skip comments and empty lines
             }
 
-            let record = match BedReader::parse_line(line) {
+            let record = match BedReader::<R>::parse_line(line) {
                 Ok(Some(rec)) => rec,
                 Ok(None) => continue,
                 Err(e) => return Some(Err(e)),
@@ -494,11 +497,11 @@ impl<R: BufRead> Iterator for LinearScanIterator<'_, R> {
 }
 
 /// An iterator over the records in a BED file.
-pub struct Records<'a> {
-    reader: &'a mut BedReader,
+pub struct Records<'a, R: Read> {
+    reader: &'a mut BedReader<R>,
 }
 
-impl Iterator for Records<'_> {
+impl<R: Read> Iterator for Records<'_, R> {
     type Item = Result<BedRecord, BedError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -574,7 +577,7 @@ where
             result
                 .map(|record| {
                     let buf = record.as_ref();
-                    BedReader::parse_line(buf)
+                    BedReader::<std::io::Empty>::parse_line(buf)
                         .expect("Failed to parse line")
                         .expect("Failed to parse line")
                 })
@@ -586,13 +589,16 @@ where
 #[cfg(test)]
 mod tests {
     use crate::{BedReader, BedRecord, BedValue, HashMap};
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::error::Error;
+    use std::fs::File;
+    use std::io::Cursor;
     use std::path::Path;
-
     #[test]
     fn test_read_bed_file() -> Result<(), Box<dyn Error>> {
         let bed_path = Path::new("tests/test.bed");
-        let mut bed_reader = BedReader::from_path(bed_path)?;
+        let mut bed_reader = BedReader::<File>::from_path(bed_path)?;
 
         let record1 = bed_reader.read_record()?.unwrap();
         assert_eq!(record1.chrom(), "chr1");
@@ -634,7 +640,7 @@ mod tests {
     #[test]
     fn test_query_bed_file() -> Result<(), Box<dyn Error>> {
         let bed_path = Path::new("tests/compr.bed.gz");
-        let mut bed_reader = BedReader::from_path(bed_path)?;
+        let mut bed_reader = BedReader::<File>::from_path(bed_path)?;
         bed_reader.set_chromosome_order(HashMap::from([
             ("chr1".to_string(), 0),
             ("chr2".to_string(), 1),
@@ -658,7 +664,7 @@ mod tests {
     #[test]
     fn test_query_first_interval() -> Result<(), Box<dyn Error>> {
         let bed_path = Path::new("tests/compr.bed.gz");
-        let mut bed_reader = BedReader::from_path(bed_path)?;
+        let mut bed_reader = BedReader::<File>::from_path(bed_path)?;
         bed_reader.set_chromosome_order(HashMap::from([
             ("chr1".to_string(), 0),
             ("chr2".to_string(), 1),
@@ -678,7 +684,7 @@ mod tests {
     fn test_get_big_interval_query() -> Result<(), Box<dyn Error>> {
         let bed_path = Path::new("tests/compr.bed.gz");
         eprintln!("starting");
-        let mut bed_reader = BedReader::from_path(bed_path)?;
+        let mut bed_reader = BedReader::<File>::from_path(bed_path)?;
         eprintln!("{:?}", bed_reader);
         bed_reader.set_chromosome_order(HashMap::from([
             ("chr1".to_string(), 0),
@@ -690,6 +696,60 @@ mod tests {
             .query(0, "chr1", 999998, 999999)?
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(records.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_first_interval_multiple_formats() -> Result<(), Box<dyn Error>> {
+        // Test data
+        let test_data = b"chr1\t1\t10\tgene1\n\
+                         chr1\t20\t30\tgene2\n\
+                         chr2\t5\t15\tgene3\n";
+
+        use crate::BedReaderType;
+        use crate::GzDecoder;
+        use std::io::BufReader;
+        use std::io::Write;
+
+        // Test uncompressed data using Cursor
+        let cursor = Cursor::new(test_data.to_vec());
+        let reader = BufReader::new(cursor);
+        let mut bed_reader = BedReader::from_reader(BedReaderType::Plain(reader), "memory")?;
+        bed_reader.set_chromosome_order(HashMap::from([
+            ("chr1".to_string(), 0),
+            ("chr2".to_string(), 1),
+        ]));
+
+        let records: Vec<BedRecord> = bed_reader
+            .query(0, "chr1", 1, 3)?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].chrom(), "chr1");
+        assert_eq!(records[0].start(), 1);
+        assert_eq!(records[0].end(), 10);
+
+        // Test gzipped data
+        let mut gz_buf = Vec::new();
+        {
+            let mut encoder = GzEncoder::new(&mut gz_buf, Compression::default());
+            encoder.write_all(test_data)?;
+        }
+        let cursor = Cursor::new(gz_buf.to_vec());
+        let reader = BufReader::new(GzDecoder::new(BufReader::new(cursor)));
+        let mut bed_reader = BedReader::from_reader(BedReaderType::Gzip(reader), "gz_memory")?;
+        bed_reader.set_chromosome_order(HashMap::from([
+            ("chr1".to_string(), 0),
+            ("chr2".to_string(), 1),
+        ]));
+
+        let records: Vec<BedRecord> = bed_reader
+            .query(0, "chr1", 1, 3)?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].chrom(), "chr1");
+        assert_eq!(records[0].start(), 1);
+        assert_eq!(records[0].end(), 10);
+
         Ok(())
     }
 }
