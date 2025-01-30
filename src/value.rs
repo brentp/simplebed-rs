@@ -18,7 +18,7 @@ impl BedValue {
     pub(crate) fn parse(s: &str) -> Self {
         if let Ok(int_val) = s.parse::<i64>() {
             BedValue::Integer(int_val)
-        } else if let Ok(float_val) = s.parse::<f64>() {
+        } else if let Ok(float_val) = fast_float::parse(s) {
             BedValue::Float(float_val)
         } else {
             BedValue::String(s.to_string())

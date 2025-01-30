@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+fast-float = "0.2.0"
 flate2 = {version = "1.0.35", features=["cloudflare_zlib"]}
 noodles = {git = "https://github.com/brentp/noodles.git", rev = "8eecb39c4", features=["bgzf", "csi", "tabix", "core"]}
 noodles-bgzf = {version="0.35.0", features=["libdeflate"]}
