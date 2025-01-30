@@ -64,8 +64,7 @@ use noodles::bgzf;
 
 //use noodles::bgzf::io::{BufRead, Read, Seek};
 use noodles::core::{Position, Region};
-use noodles::csi::BinningIndex;
-use noodles::csi::{self as csi, binning_index::index::reference_sequence::bin::Chunk};
+use noodles::csi;
 use noodles::tabix;
 use std::collections::HashMap;
 use std::fs::File;
@@ -80,6 +79,9 @@ pub use record::BedRecord;
 
 pub mod writer;
 pub use writer::BedWriter;
+
+pub mod index;
+use index::{BedIndex, Skip, SkipIndex};
 
 /// Errors available in this library.
 #[derive(Debug, thiserror::Error)]
@@ -96,33 +98,12 @@ pub enum BedError {
     /// Ng no chromosome order found when querying.
     #[error("No chromosome order found.")]
     NoChromosomeOrder,
-}
-
-/// Represents the type of index available for the BED file
-#[derive(Debug)]
-enum BedIndex {
-    Tabix(tabix::Index),
-    Csi(csi::Index),
-    None,
-}
-
-impl BedIndex {
-    fn query(&self, tid: usize, region: &Region) -> Option<io::Result<Vec<Chunk>>> {
-        match self {
-            BedIndex::Tabix(index) => Some(index.query(tid, region.interval())),
-            BedIndex::Csi(index) => Some(index.query(tid, region.interval())),
-            BedIndex::None => None,
-        }
-    }
-
-    /// Return the csi header which contains the reference sequence names
-    fn header(&self) -> Option<&csi::binning_index::index::Header> {
-        match self {
-            BedIndex::Tabix(index) => index.header(),
-            BedIndex::Csi(index) => index.header(),
-            BedIndex::None => None,
-        }
-    }
+    /// Bed File chromosome order does not match genome file.
+    #[error("Bed File chromosome order does not match genome file.")]
+    ChromosomeOrderMismatch,
+    /// Chromosome not found in chromosome order.
+    #[error("Chromosome not found in chromosome order.")]
+    ChromosomeNotFound,
 }
 
 /// Represents different types of readers for BED files
@@ -162,6 +143,7 @@ pub struct BedReader<R: Read> {
     index: BedIndex,
     current_region: Option<Region>,
     chromosome_order: Option<HashMap<String, usize>>,
+    skip_index: Option<SkipIndex>,
 }
 
 impl<R: Read> BedReader<R> {
@@ -287,9 +269,12 @@ impl<R: Read> BedReader<R> {
             index,
             current_region: None,
             chromosome_order: None,
+            skip_index: None,
         })
     }
 }
+
+const SKIP_CHUNKS: u64 = 1000;
 
 impl<R: Read + Seek> BedReader<R> {
     /// Query the BED file for records overlapping the given region.
@@ -346,13 +331,40 @@ impl<R: Read + Seek> BedReader<R> {
             Err(BedError::NoChromosomeOrder)
         };
 
-        // Create a region query
+        // Continue with existing query logic
         let start_pos = Position::try_from(start).map_err(|e| {
             BedError::ParseError(format!("Invalid start coordinate: {}. Error: {}", start, e))
         })?;
         let stop_pos = Position::try_from(stop).map_err(|e| {
             BedError::ParseError(format!("Invalid stop coordinate: {}. Error: {}", stop, e))
         })?;
+
+        // If we have a skip index and we're querying a different chromosome,
+        // or we are on same chrom but the new start is before the current end,
+        // try to seek to the approximate position
+        if let Some(skip_index) = &self.skip_index {
+            if self.current_region.is_none()
+                || self.current_region.as_ref().unwrap().name() != chrom
+                || self
+                    .current_region
+                    .as_ref()
+                    .unwrap()
+                    .interval()
+                    .end()
+                    .unwrap()
+                    > start_pos
+            {
+                let tid = tid.as_ref().unwrap(); // we know we have tid since we checked it above
+                if let Some(seek_pos) = skip_index.find_seek_position(*tid) {
+                    match &mut self.reader {
+                        BedReaderType::Plain(reader) => {
+                            reader.seek(std::io::SeekFrom::Start(seek_pos))?;
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
         self.current_region = Some(Region::new(chrom.to_string(), start_pos..=stop_pos));
 
         // Get chunks that overlap this region
@@ -410,6 +422,103 @@ impl<R: Read + Seek> BedReader<R> {
             };
 
         Ok(iter)
+    }
+
+    /// Build a skip index for faster chromosome access
+    pub fn build_skip_index(&mut self) -> Result<(), BedError> {
+        // Only build if we have chromosome order
+        let chromosome_order = self
+            .chromosome_order
+            .as_ref()
+            .ok_or(BedError::NoChromosomeOrder)?;
+
+        // Get current position to restore later
+        let start_pos = match &mut self.reader {
+            BedReaderType::Plain(reader) => reader.stream_position()?,
+            BedReaderType::Gzip(_) => {
+                return Err(BedError::InvalidFormat(
+                    "Cannot build skip index for gzip files".to_string(),
+                ))
+            }
+            BedReaderType::Bgzf(_) => {
+                return Err(BedError::InvalidFormat(
+                    "Bgzf skip index not yet implemented".to_string(),
+                ))
+            }
+        };
+
+        // Get file size
+        let file_size = match &mut self.reader {
+            BedReaderType::Plain(reader) => {
+                reader.seek(std::io::SeekFrom::End(0))?;
+                let size = reader.stream_position()?;
+                reader.seek(std::io::SeekFrom::Start(start_pos))?;
+                size
+            }
+            _ => unreachable!(),
+        };
+
+        let chunk_size = file_size / (SKIP_CHUNKS + 1);
+        let mut skip_index = SkipIndex::new();
+        let mut buf = String::new();
+
+        for i in 1..=SKIP_CHUNKS {
+            let target_pos = i * chunk_size;
+
+            // Seek to approximate position
+            match &mut self.reader {
+                BedReaderType::Plain(reader) => {
+                    reader.seek(std::io::SeekFrom::Start(target_pos))?;
+
+                    // Read until newline
+                    if target_pos > 0 {
+                        buf.clear();
+                        reader.read_line(&mut buf)?;
+                    }
+
+                    // Get position after newline
+                    let pos = reader.stream_position()?;
+
+                    // Read next line to get chromosome
+                    buf.clear();
+                    if reader.read_line(&mut buf)? == 0 {
+                        break; // EOF
+                    }
+
+                    // Parse chromosome from line
+                    let fields: Vec<&str> = buf.trim_end().split('\t').collect();
+                    if !fields.is_empty() {
+                        let chrom = fields[0].to_string();
+                        if let Some(&tid) = chromosome_order.get(&chrom) {
+                            skip_index.entries.push(Skip::new(chrom, tid, pos));
+                        } else {
+                            return Err(BedError::ChromosomeNotFound);
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        // Restore original position
+        match &mut self.reader {
+            BedReaderType::Plain(reader) => {
+                reader.seek(std::io::SeekFrom::Start(start_pos))?;
+            }
+            _ => unreachable!(),
+        }
+
+        skip_index.optimize();
+        // check that entries are sorted by tid
+        if !skip_index.entries.is_sorted_by_key(|skip| skip.tid) {
+            return Err(BedError::ChromosomeOrderMismatch);
+        }
+        assert!(skip_index.entries.is_sorted_by_key(|skip| skip.seek_pos));
+
+        // Store the index
+        self.skip_index = Some(skip_index);
+
+        Ok(())
     }
 }
 
@@ -608,6 +717,96 @@ mod tests {
     use std::fs::File;
     use std::io::Cursor;
     use std::path::Path;
+
+    fn setup_test_bed() -> Result<(), Box<dyn Error>> {
+        use std::fs::File;
+        use std::io::Write;
+
+        let test_dir = Path::new("tests");
+        if !test_dir.exists() {
+            std::fs::create_dir(test_dir)?;
+        }
+
+        let path = test_dir.join("generated.bed");
+        let mut file = File::create(path)?;
+
+        // Write 10,000 entries for each chromosome from chr1 to chr22
+        for chrom in 1..=22 {
+            let chrom_name = format!("chr{}", chrom);
+
+            for i in 0..5000 {
+                let start = i * 100;
+                let end = start + 50; // Each entry is 50 bases long
+                let score = (i % 100) as f64; // Cycle scores from 0 to 99
+                let name = format!("feat_{}_{}", chrom, i);
+
+                writeln!(
+                    file,
+                    "{}\t{}\t{}\t{}\t{}",
+                    chrom_name, start, end, name, score,
+                )?;
+            }
+        }
+
+        file.flush()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_skip_index() -> Result<(), Box<dyn Error>> {
+        setup_test_bed()?;
+
+        let path = Path::new("tests/generated.bed");
+        let mut bed_reader = BedReader::<File>::from_path(path)?;
+        bed_reader.set_chromosome_order(
+            (1..=22)
+                .map(|i| (format!("chr{}", i), i - 1))
+                .collect::<HashMap<_, _>>(),
+        );
+        bed_reader.build_skip_index()?;
+        eprintln!("{:?}", bed_reader.skip_index);
+        /* this is no longer true because we optimize the skip index
+        assert_eq!(
+            bed_reader.skip_index.as_ref().unwrap().entries.len(),
+            crate::SKIP_CHUNKS as usize
+        );
+        */
+
+        let records: Vec<BedRecord> = bed_reader
+            .query("chr19", 1, 102)?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].chrom(), "chr19");
+        assert_eq!(records[1].chrom(), "chr19");
+
+        let records: Vec<BedRecord> = bed_reader
+            .query("chr19", 1, 10)?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].chrom(), "chr19");
+
+        // Time 1000 queries and calculate queries per second
+        let start = std::time::Instant::now();
+        let iterations = 1000;
+
+        for _ in 0..iterations {
+            let records: Vec<BedRecord> = bed_reader
+                .query("chr19", 1, 10)?
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].chrom(), "chr19");
+        }
+
+        let duration = start.elapsed();
+        let qps = iterations as f64 / duration.as_secs_f64();
+        println!(
+            "Performed {} queries in {:?} ({:.2} queries/sec)",
+            iterations, duration, qps
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn test_read_bed_file() -> Result<(), Box<dyn Error>> {
         let bed_path = Path::new("tests/test.bed");
@@ -654,10 +853,11 @@ mod tests {
     fn test_query_bed_file() -> Result<(), Box<dyn Error>> {
         let bed_path = Path::new("tests/compr.bed.gz");
         let mut bed_reader = BedReader::<File>::from_path(bed_path)?;
-        bed_reader.set_chromosome_order(HashMap::from([
-            ("chr1".to_string(), 0),
-            ("chr2".to_string(), 1),
-        ]));
+        bed_reader.set_chromosome_order(
+            (1..=22)
+                .map(|i| (format!("chr{}", i), i - 1))
+                .collect::<HashMap<_, _>>(),
+        );
 
         let records: Vec<BedRecord> = bed_reader
             .query("chr1", 22, 34)?
@@ -678,10 +878,11 @@ mod tests {
     fn test_query_first_interval() -> Result<(), Box<dyn Error>> {
         let bed_path = Path::new("tests/compr.bed.gz");
         let mut bed_reader = BedReader::<File>::from_path(bed_path)?;
-        bed_reader.set_chromosome_order(HashMap::from([
-            ("chr1".to_string(), 0),
-            ("chr2".to_string(), 1),
-        ]));
+        bed_reader.set_chromosome_order(
+            (1..=22)
+                .map(|i| (format!("chr{}", i), i - 1))
+                .collect::<HashMap<_, _>>(),
+        );
 
         let records: Vec<BedRecord> = bed_reader
             .query("chr1", 1, 3)?
@@ -699,10 +900,11 @@ mod tests {
         eprintln!("starting");
         let mut bed_reader = BedReader::<File>::from_path(bed_path)?;
         eprintln!("{:?}", bed_reader);
-        bed_reader.set_chromosome_order(HashMap::from([
-            ("chr1".to_string(), 0),
-            ("chr2".to_string(), 1),
-        ]));
+        bed_reader.set_chromosome_order(
+            (1..=22)
+                .map(|i| (format!("chr{}", i), i - 1))
+                .collect::<HashMap<_, _>>(),
+        );
         eprintln!("{:?}", bed_reader.chromosome_order);
 
         let records: Vec<BedRecord> = bed_reader
@@ -728,10 +930,11 @@ mod tests {
         let cursor = Cursor::new(test_data.to_vec());
         let reader = BufReader::new(cursor);
         let mut bed_reader = BedReader::from_reader(BedReaderType::Plain(reader), "memory")?;
-        bed_reader.set_chromosome_order(HashMap::from([
-            ("chr1".to_string(), 0),
-            ("chr2".to_string(), 1),
-        ]));
+        bed_reader.set_chromosome_order(
+            (1..=22)
+                .map(|i| (format!("chr{}", i), i - 1))
+                .collect::<HashMap<_, _>>(),
+        );
 
         let records: Vec<BedRecord> = bed_reader
             .query("chr1", 1, 3)?
@@ -750,10 +953,11 @@ mod tests {
         let cursor = Cursor::new(gz_buf.to_vec());
         let reader = BufReader::new(GzDecoder::new(BufReader::new(cursor)));
         let mut bed_reader = BedReader::from_reader(BedReaderType::Gzip(reader), "gz_memory")?;
-        bed_reader.set_chromosome_order(HashMap::from([
-            ("chr1".to_string(), 0),
-            ("chr2".to_string(), 1),
-        ]));
+        bed_reader.set_chromosome_order(
+            (1..=22)
+                .map(|i| (format!("chr{}", i), i - 1))
+                .collect::<HashMap<_, _>>(),
+        );
 
         let records: Vec<BedRecord> = bed_reader
             .query("chr1", 1, 3)?
