@@ -76,6 +76,11 @@ impl BedRecord {
         &self.other_fields
     }
 
+    /// Adds a new field to other_fields
+    pub fn push_field(&mut self, value: BedValue) {
+        self.other_fields.push(value);
+    }
+
     /// Parse a BED record from a string.
     pub fn parse_line(line: &str) -> Result<Option<BedRecord>, BedError> {
         let mut fields = line.split('\t');
@@ -162,5 +167,17 @@ mod tests {
         record.set_end(2600);
         assert_eq!(record.start(), 1600);
         assert_eq!(record.end(), 2600);
+    }
+
+    #[test]
+    fn test_push_field() {
+        let mut record = BedRecord::new("chr1".to_string(), 1000, 2000, None, None, vec![]);
+
+        record.push_field(BedValue::String("test_value".to_string()));
+        assert_eq!(record.other_fields().len(), 1);
+        assert_eq!(
+            record.other_fields()[0],
+            BedValue::String("test_value".to_string())
+        );
     }
 }
