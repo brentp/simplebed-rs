@@ -51,6 +51,16 @@ impl BedRecord {
         self.end
     }
 
+    /// Sets the start coordinate (0-based).
+    pub fn set_start(&mut self, start: u64) {
+        self.start = start;
+    }
+
+    /// Sets the end coordinate (exclusive).
+    pub fn set_end(&mut self, end: u64) {
+        self.end = end;
+    }
+
     /// Returns the name, if present.
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
@@ -121,5 +131,36 @@ impl BedRecord {
             score,
             other_fields,
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_set_start_end() {
+        let mut record = BedRecord::new(
+            "chr1".to_string(),
+            1000,
+            2000,
+            Some("feature1".to_string()),
+            Some(100.0),
+            vec![],
+        );
+
+        // Test set_start
+        record.set_start(1500);
+        assert_eq!(record.start(), 1500);
+
+        // Test set_end
+        record.set_end(2500);
+        assert_eq!(record.end(), 2500);
+
+        // Test multiple sets
+        record.set_start(1600);
+        record.set_end(2600);
+        assert_eq!(record.start(), 1600);
+        assert_eq!(record.end(), 2600);
     }
 }
