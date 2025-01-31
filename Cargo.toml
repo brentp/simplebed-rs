@@ -11,12 +11,12 @@ noodles = {git = "https://github.com/brentp/noodles.git", rev = "8eecb39c4", fea
 noodles-bgzf = {version="0.35.0", features=["libdeflate"]}
 noodles-csi = {git = "https://github.com/brentp/noodles.git", rev = "8eecb39c4"}
 noodles-tabix = "0.49.0"
-tempfile = "3.15.0"
-thiserror = "2.0.11"
+thiserror = "^2"
 #tokio = {version = "1.43.0", features=["io-util", "fs", "test-util", "macros"]}
 
 [dev-dependencies]
 criterion = "0.5.1"
+tempfile = "3.16.0"
 
 [[bench]]
 name = "skipindex"
