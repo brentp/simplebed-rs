@@ -281,7 +281,7 @@ impl<R: Read + Seek> BedReader<R> {
         };
 
         // Continue with existing query logic
-        let start_pos = Position::try_from(start).map_err(|e| {
+        let start_pos = Position::try_from(start + 1).map_err(|e| {
             BedError::ParseError(format!("Invalid start coordinate: {}. Error: {}", start, e))
         })?;
         let stop_pos = Position::try_from(stop).map_err(|e| {
@@ -823,6 +823,26 @@ mod tests {
 
         let records: Vec<BedRecord> = bed_reader
             .query("chr1", 1, 3)?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].chrom(), "chr1");
+        assert_eq!(records[0].start(), 1);
+        assert_eq!(records[0].end(), 10);
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_0_start() -> Result<(), Box<dyn Error>> {
+        let bed_path = Path::new("tests/compr.bed.gz");
+        let mut bed_reader = BedReader::<File>::from_path(bed_path)?;
+        bed_reader.set_chromosome_order(
+            (1..=22)
+                .map(|i| (format!("chr{}", i), i - 1))
+                .collect::<HashMap<_, _>>(),
+        );
+
+        let records: Vec<BedRecord> = bed_reader
+            .query("chr1", 0, 10)?
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].chrom(), "chr1");
