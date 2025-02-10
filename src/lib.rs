@@ -222,14 +222,32 @@ impl<R: Read> BedReader<R> {
             BedIndex::None
         };
 
-        Ok(BedReader {
+        let mut br = BedReader {
             reader,
             index,
             current_region: None,
             chromosome_order: None,
             skip_index: None,
             buf: String::new(),
-        })
+        };
+        br.chromosome_order = br.chrom_order_from_index();
+        Ok(br)
+    }
+
+    fn chrom_order_from_index(&self) -> Option<HashMap<String, usize>> {
+        match &self.index {
+            BedIndex::Csi(_) | BedIndex::Tabix(_) => {
+                let header = self.index.header().expect("No header found");
+                let chrom_order = header
+                    .reference_sequence_names()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| (name.to_string(), i))
+                    .collect();
+                Some(chrom_order)
+            }
+            BedIndex::None => None,
+        }
     }
 }
 
@@ -923,6 +941,37 @@ mod tests {
         assert_eq!(records[0].chrom(), "chr1");
         assert_eq!(records[0].start(), 1);
         assert_eq!(records[0].end(), 10);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_chrom_order_from_index() -> Result<(), Box<dyn Error>> {
+        // Test with indexed file (using the existing compressed test file)
+        let bed_path = Path::new("tests/compr.bed.gz");
+        let bed_reader = BedReader::<File>::from_path(bed_path)?;
+
+        // Get chromosome order from index
+        let chrom_order = bed_reader.chrom_order_from_index();
+
+        // Verify that we got a chromosome order (since compr.bed.gz should have an index)
+        assert!(chrom_order.is_some());
+
+        if let Some(order) = chrom_order {
+            // Verify some expected chromosomes are present with correct ordering
+            assert_eq!(order.get("chr1"), Some(&0));
+            // Add more assertions based on your test data
+        }
+
+        // Test with non-indexed file
+        let bed_path = Path::new("tests/test.bed");
+        let bed_reader = BedReader::<File>::from_path(bed_path)?;
+
+        // Get chromosome order from non-indexed file
+        let chrom_order = bed_reader.chrom_order_from_index();
+
+        // Verify that we get None for a non-indexed file
+        assert!(chrom_order.is_none());
 
         Ok(())
     }
