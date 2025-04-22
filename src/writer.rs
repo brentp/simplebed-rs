@@ -3,7 +3,7 @@ use crate::BedError;
 use crate::BedRecord;
 use noodles::bgzf;
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 /// A writer for BED files, supporting plain text and BGZF compression.
@@ -22,7 +22,7 @@ impl BedWriter {
             let bgzf_writer = bgzf::Writer::new(file);
             Box::new(bgzf_writer) // Box the Writer<bgzf::Writer>
         } else {
-            Box::new(file) // Box the Writer<File>
+            Box::new(BufWriter::new(file)) // Box the Writer<File>
         };
         Self::from_writer(writer)
     }
