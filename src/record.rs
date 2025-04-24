@@ -71,6 +71,16 @@ impl BedRecord {
         self.score
     }
 
+    /// Sets the score
+    pub fn set_score(&mut self, score: f64) {
+        self.score = Some(score);
+    }
+
+    /// Sets the name
+    pub fn set_name(&mut self, name: String) {
+        self.name = Some(name);
+    }
+
     /// Returns a slice of the other fields.
     pub fn other_fields(&self) -> &[BedValue] {
         &self.other_fields
@@ -179,5 +189,31 @@ mod tests {
             record.other_fields()[0],
             BedValue::String("test_value".to_string())
         );
+    }
+
+    #[test]
+    fn test_set_name() {
+        let mut record = BedRecord::new("chr1".to_string(), 1000, 2000, None, None, vec![]);
+
+        // Test setting name on a record with no name
+        record.set_name("feature1".to_string());
+        assert_eq!(record.name(), Some("feature1"));
+
+        // Test updating an existing name
+        record.set_name("feature2".to_string());
+        assert_eq!(record.name(), Some("feature2"));
+    }
+
+    #[test]
+    fn test_set_score() {
+        let mut record = BedRecord::new("chr1".to_string(), 1000, 2000, None, None, vec![]);
+
+        // Test setting score on a record with no score
+        record.set_score(45.5);
+        assert_eq!(record.score(), Some(45.5));
+
+        // Test updating an existing score
+        record.set_score(100.0);
+        assert_eq!(record.score(), Some(100.0));
     }
 }
