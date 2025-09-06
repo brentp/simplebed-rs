@@ -175,7 +175,7 @@ impl<R: Read> BedReader<R> {
     }
 
     /// Returns an iterator over the records in the BED file.
-    pub fn records(&mut self) -> Records<R> {
+    pub fn records(&mut self) -> Records<'_, R> {
         Records { reader: self }
     }
 
@@ -324,11 +324,10 @@ impl<R: Read + Seek> BedReader<R> {
 
         // Get chunks that overlap this region
         let qchunks = if let Ok(tid) = tid {
-            eprintln!("region: {:?}", self.current_region);
             self.index
                 .query(tid, self.current_region.as_ref().unwrap())
                 .transpose()
-                .map_err(|e| BedError::IoError(e))?
+                .map_err(BedError::IoError)?
         } else {
             None
         };
