@@ -302,7 +302,7 @@ impl<R: Read + Seek> BedReader<R> {
         let start_pos = Position::try_from(start + 1).map_err(|e| {
             BedError::ParseError(format!("Invalid start coordinate: {}. Error: {}", start, e))
         })?;
-        let stop_pos = Position::try_from(stop).map_err(|e| {
+        let stop_pos = Position::try_from(stop.min(usize::MAX - 1)).map_err(|e| {
             BedError::ParseError(format!("Invalid stop coordinate: {}. Error: {}", stop, e))
         })?;
 
@@ -324,7 +324,11 @@ impl<R: Read + Seek> BedReader<R> {
 
         // Get chunks that overlap this region
         let qchunks = if let Ok(tid) = tid {
-            self.index.query(tid, self.current_region.as_ref().unwrap())
+            eprintln!("region: {:?}", self.current_region);
+            self.index
+                .query(tid, self.current_region.as_ref().unwrap())
+                .transpose()
+                .map_err(|e| BedError::IoError(e))?
         } else {
             None
         };
@@ -358,7 +362,7 @@ impl<R: Read + Seek> BedReader<R> {
                         .as_ref()
                         .ok_or(BedError::NoChromosomeOrder)?,
                 )),
-                (Some(Ok(chunks)), BedReaderType::Bgzf(ref mut reader)) => {
+                (Some(chunks), BedReaderType::Bgzf(ref mut reader)) => {
                     let q = csi::io::Query::new(reader, chunks);
                     let header = self.index.header().expect("No header found");
                     let q = q
@@ -373,7 +377,7 @@ impl<R: Read + Seek> BedReader<R> {
                     };
                     Box::new(iter)
                 }
-                _ => unimplemented!(),
+                (a, b) => panic!("Unimplemented combination: a: {:?}, b: {:?}", a, b),
             };
 
         Ok(iter)
