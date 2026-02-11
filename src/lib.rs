@@ -118,7 +118,7 @@ pub enum BedReaderType<R: Read> {
     /// A gzip compressed reader.
     Gzip(BufReader<GzDecoder<BufReader<R>>>), // Wrap GzDecoder in BufReader
     /// A bgzf compressed reader.
-    Bgzf(bgzf::Reader<BufReader<R>>),
+    Bgzf(bgzf::io::Reader<BufReader<R>>),
 }
 
 impl<R: Read> std::fmt::Debug for BedReaderType<R> {
@@ -189,7 +189,7 @@ impl<R: Read> BedReader<R> {
 
         let reader = match compression {
             Compression::GZ => BedReaderType::Gzip(BufReader::new(GzDecoder::new(reader))),
-            Compression::BGZF => BedReaderType::Bgzf(bgzf::Reader::new(reader)),
+            Compression::BGZF => BedReaderType::Bgzf(bgzf::io::Reader::new(reader)),
             _ => BedReaderType::Plain(reader),
         };
 

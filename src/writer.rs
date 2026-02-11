@@ -19,7 +19,7 @@ impl BedWriter {
         let file = File::create(path_ref)?;
         let writer: Box<dyn Write> = if path_ref.extension().and_then(|s| s.to_str()) == Some("gz")
         {
-            let bgzf_writer = bgzf::Writer::new(file);
+            let bgzf_writer = bgzf::io::Writer::new(file);
             Box::new(bgzf_writer) // Box the Writer<bgzf::Writer>
         } else {
             Box::new(BufWriter::new(file)) // Box the Writer<File>
