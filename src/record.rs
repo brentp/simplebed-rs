@@ -130,13 +130,21 @@ impl BedRecord {
         // Optional fields
         let name = fields.next().filter(|f| !f.is_empty()).map(String::from);
 
-        let score = fields
-            .next()
-            .filter(|f| !f.is_empty())
-            .and_then(|s| s.parse::<f64>().ok());
+        let mut score = None;
+        let mut other_fields: Vec<BedValue> = Vec::new();
+
+        if let Some(raw_score) = fields.next() {
+            if raw_score.is_empty() {
+                other_fields.push(BedValue::String(String::new()));
+            } else if let Ok(parsed_score) = raw_score.parse::<f64>() {
+                score = Some(parsed_score);
+            } else {
+                other_fields.push(BedValue::parse(raw_score));
+            }
+        }
 
         // Remaining fields
-        let other_fields: Vec<BedValue> = fields.map(BedValue::parse).collect();
+        other_fields.extend(fields.map(BedValue::parse));
 
         Ok(Some(BedRecord::new(
             chrom,
@@ -215,5 +223,32 @@ mod tests {
         // Test updating an existing score
         record.set_score(100.0);
         assert_eq!(record.score(), Some(100.0));
+    }
+
+    #[test]
+    fn test_parse_line_non_numeric_score_added_to_other_fields() {
+        let line = "chr1\t1000\t2000\tfeature1\tnot_a_number\t42";
+        let record = BedRecord::parse_line(line).unwrap().unwrap();
+
+        assert_eq!(record.score(), None);
+        assert_eq!(
+            record.other_fields(),
+            &[
+                BedValue::String("not_a_number".to_string()),
+                BedValue::Integer(42)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_line_empty_score_added_to_other_fields() {
+        let line = "chr1\t1000\t2000\tfeature1\t\t42";
+        let record = BedRecord::parse_line(line).unwrap().unwrap();
+
+        assert_eq!(record.score(), None);
+        assert_eq!(
+            record.other_fields(),
+            &[BedValue::String(String::new()), BedValue::Integer(42)]
+        );
     }
 }
