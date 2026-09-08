@@ -302,9 +302,17 @@ impl<R: Read + Seek> BedReader<R> {
         let start_pos = Position::try_from(start + 1).map_err(|e| {
             BedError::ParseError(format!("Invalid start coordinate: {}. Error: {}", start, e))
         })?;
-        let stop_pos = Position::try_from(stop.min(usize::MAX - 1)).map_err(|e| {
-            BedError::ParseError(format!("Invalid stop coordinate: {}. Error: {}", stop, e))
-        })?;
+        // `usize::MAX` is the sentinel used by callers for an unbounded query.
+        // Keep that bound open when constructing the noodles region: converting
+        // it to an explicit coordinate exceeds Tabix/CSI's supported maximum
+        // and causes indexed queries to fail with "invalid end bound".
+        let stop_pos = if stop == usize::MAX {
+            None
+        } else {
+            Some(Position::try_from(stop).map_err(|e| {
+                BedError::ParseError(format!("Invalid stop coordinate: {}. Error: {}", stop, e))
+            })?)
+        };
 
         // If we have a skip index and we're querying a different chromosome,
         // or we are on same chrom but the new start is before the current end,
@@ -320,7 +328,10 @@ impl<R: Read + Seek> BedReader<R> {
                 }
             }
         }
-        self.current_region = Some(Region::new(chrom.to_string(), start_pos..=stop_pos));
+        self.current_region = Some(match stop_pos {
+            Some(stop_pos) => Region::new(chrom.to_string(), start_pos..=stop_pos),
+            None => Region::new(chrom.to_string(), start_pos..),
+        });
 
         // Get chunks that overlap this region
         let qchunks = if let Ok(tid) = tid {
@@ -869,6 +880,25 @@ mod tests {
         assert_eq!(records[0].chrom(), "chr1");
         assert_eq!(records[0].start(), 1);
         assert_eq!(records[0].end(), 10);
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_unbounded_end_on_indexed_bed() -> Result<(), Box<dyn Error>> {
+        let bed_path = Path::new("tests/compr.bed.gz");
+        let mut bed_reader = BedReader::<File>::from_path(bed_path)?;
+        bed_reader.set_chromosome_order(
+            (1..=22)
+                .map(|i| (format!("chr{}", i), i - 1))
+                .collect::<HashMap<_, _>>(),
+        );
+
+        let records: Vec<BedRecord> = bed_reader
+            .query("chr1", 0, usize::MAX)?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(records.len(), 5);
+        assert_eq!(records[0].chrom(), "chr1");
+        assert_eq!(records[1].chrom(), "chr1");
         Ok(())
     }
 
