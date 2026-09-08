@@ -125,4 +125,32 @@ mod tests {
         fs::remove_file(output_path)?; // Cleanup test file
         Ok(())
     }
+
+    #[test]
+    fn test_round_trip_string_score_column_to_other_fields() -> Result<(), Box<dyn Error>> {
+        let line = "chr1\t10000\t10468\ttrf\tTAACCC";
+        let record = BedRecord::parse_line(line)?.unwrap();
+        assert_eq!(record.score(), None);
+        assert_eq!(
+            record.other_fields(),
+            &[BedValue::String("TAACCC".to_string())]
+        );
+
+        let output_path = Path::new("output_test_round_trip_string_score.bed");
+        let mut bed_writer = BedWriter::new(output_path)?;
+        bed_writer.write_record(&record)?;
+        bed_writer.flush()?;
+
+        let mut bed_reader = BedReader::<File>::from_path(output_path)?;
+        let round_tripped = bed_reader.read_record()?.unwrap();
+        assert_eq!(round_tripped.score(), None);
+        assert_eq!(
+            round_tripped.other_fields(),
+            &[BedValue::String("TAACCC".to_string())]
+        );
+        assert_eq!(round_tripped, record);
+
+        fs::remove_file(output_path)?;
+        Ok(())
+    }
 }
